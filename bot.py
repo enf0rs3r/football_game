@@ -8,14 +8,20 @@ from aiogram.filters import Command
 from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import State, StatesGroup
 from datetime import datetime, timedelta
+from dotenv import load_dotenv
+
+load_dotenv()
+
+TOKEN = os.getenv("TOKEN")
+DATABASE_URL = os.getenv("DATABASE_URL")
 
 # --- SQLAlchemy и PostgreSQL ---
 from sqlalchemy.ext.asyncio import create_async_engine, AsyncSession
 from sqlalchemy.orm import sessionmaker, declarative_base
-from sqlalchemy import Column, BigInteger, String, Integer, Boolean, select, update
+from sqlalchemy import Column, BigInteger, String, Integer, Boolean, select, update, delete
 
 # Строка подключения к PostgreSQL
-DATABASE_URL = "postgresql+asyncpg://postgres:za2012raza1A@localhost:5432/football_game"
+
 engine = create_async_engine(DATABASE_URL, echo=False)
 AsyncSessionLocal = sessionmaker(engine, expire_on_commit=False, class_=AsyncSession)
 Base = declarative_base()
@@ -66,14 +72,13 @@ async def update_player_club(user_id, club):
 async def update_player_squad_status(user_id, is_in_squad):
     await update_player_stats(user_id, is_in_squad=is_in_squad)
 
-# --- Инициализация базы ---
+# --- Инициализция базы ---
 async def init_db():
     async with engine.begin() as conn:
         await conn.run_sync(Base.metadata.create_all)
 
 # --- Остальной код бота (пример для /start) ---
 # Замените на свой токен бота
-TOKEN = "7949157623:AAFpbsPfvkWrPSYgTrNztWQNwJdiSN8zE0w"
 CHANNEL_ID = "@football_simulator"
 
 class GameStates(StatesGroup):
@@ -218,8 +223,7 @@ async def cmd_start(message: types.Message, state: FSMContext):
     data = await state.get_data()
     if data.get('match_state'):
         await message.answer(
-            "❌ Сейчас идет матч! Дождитесь его завершения.",
-            reply_markup=get_main_keyboard()
+            "❌ Сейчас идет матч! Дождитесь его завершения."
         )
         return
 
@@ -286,7 +290,6 @@ async def process_name(message: types.Message, state: FSMContext):
             reply_markup=get_subscription_keyboard()
         )
         return
-    
     await state.update_data(name=message.text)
     await state.set_state(GameStates.waiting_position)
     await message.answer(
@@ -325,6 +328,23 @@ async def process_position(callback: types.CallbackQuery, state: FSMContext):
     )
     await callback.answer()
 
+def get_initial_player_date():
+    """Определяет начальную дату для нового игрока"""
+    current_date = datetime.now()
+    current_month = current_date.month
+    
+    # Если сейчас сезон активен, используем текущую дату
+    if is_season_active(current_date):
+        return current_date.strftime("%Y-%m-%d")
+    
+    # Если сейчас не сезон, устанавливаем дату на начало следующего сезона
+    if current_month < SEASON_START_MONTH:
+        # Если до начала сезона, устанавливаем на начало текущего года
+        return datetime(current_date.year, SEASON_START_MONTH, 1).strftime("%Y-%m-%d")
+    else:
+        # Если после окончания сезона, устанавливаем на начало следующего года
+        return datetime(current_date.year + 1, SEASON_START_MONTH, 1).strftime("%Y-%m-%d")
+
 @dp.callback_query(lambda c: c.data.startswith('choose_club_'), GameStates.waiting_club_choice)
 async def process_club_choice(callback: types.CallbackQuery, state: FSMContext):
     club = callback.data.split('_')[2]
@@ -332,7 +352,9 @@ async def process_club_choice(callback: types.CallbackQuery, state: FSMContext):
     name = user_data['name']
     position = user_data['position']  # Получаем позицию из состояния
     
-    await create_player(callback.from_user.id, name, position, club, SEASON_START_DATE)
+    # Получаем начальную дату для игрока
+    start_date = get_initial_player_date()
+    await create_player(callback.from_user.id, name, position, club, start_date)
     await state.set_state(GameStates.playing)
     
     welcome_text = (
@@ -367,7 +389,8 @@ def is_season_active(virtual_date):
 def is_winter_break(virtual_date):
     """Проверяет, идет ли сейчас зимний перерыв в виртуальном времени"""
     current_month = virtual_date.month
-    return WINTER_BREAK_START <= current_month or current_month <= WINTER_BREAK_END
+    # Зимний перерыв с декабря по январь
+    return current_month == 12 or current_month == 1
 
 async def can_play_match(user_id):
     """Проверяет, может ли игрок сыграть матч в виртуальном времени"""
@@ -380,8 +403,41 @@ async def can_play_match(user_id):
     if not is_season_active(virtual_date):
         return False, "❌ Сезон еще не начался или уже закончился. Следующий сезон начнется в сентябре."
     
+    # Если сейчас зимний перерыв, продвигаем дату до февраля
     if is_winter_break(virtual_date):
+        # Продвигаем дату до февраля
+        new_date = virtual_date.replace(month=2, day=1)
+        # Обновляем дату в базе
+        await update_player_stats(
+            user_id=user_id,
+            last_match_date=new_date.strftime("%d.%m.%Y")
+        )
         return False, "❌ Сейчас зимний перерыв. Матчи возобновятся в феврале."
+    
+    # Проверяем, есть ли матч в текущем туре
+    current_round = player.current_round if player.matches > 0 else 1
+    opponent = get_opponent_by_round(player.club, current_round)
+    
+    # Если матча нет, продвигаем дату и тур
+    while not opponent and current_round <= len(MATCH_CALENDAR):
+        current_round += 1
+        opponent = get_opponent_by_round(player.club, current_round)
+        # Продвигаем дату на неделю
+        new_date = virtual_date + timedelta(days=DAYS_BETWEEN_MATCHES)
+        if new_date.month == SEASON_START_MONTH and virtual_date.month != SEASON_START_MONTH:
+            new_date = new_date.replace(year=new_date.year + 1)
+        virtual_date = new_date
+        # Обновляем дату в базе
+        await update_player_stats(
+            user_id=user_id,
+            current_round=current_round,
+            last_match_date=virtual_date.strftime("%d.%m.%Y")
+        )
+    
+    # Если дошли до конца календаря, начинаем новый
+    if current_round > len(MATCH_CALENDAR):
+        current_round = 1
+        opponent = get_opponent_by_round(player.club, current_round)
     
     return True, ""
 
@@ -395,6 +451,35 @@ async def advance_virtual_date(player):
         new_date = new_date.replace(year=new_date.year + 1)
     
     return new_date.strftime("%d.%m.%Y")
+
+# Создаем календарь матчей
+def create_calendar():
+    clubs = list(FNL_SILVER_CLUBS.keys())
+    calendar = []
+    # Первый круг
+    for i in range(len(clubs)):
+        for j in range(i + 1, len(clubs)):
+            calendar.append((clubs[i], clubs[j]))
+    # Второй круг (домашние матчи меняются местами)
+    for i in range(len(clubs)):
+        for j in range(i + 1, len(clubs)):
+            calendar.append((clubs[j], clubs[i]))
+    return calendar
+
+# Глобальный календарь матчей
+MATCH_CALENDAR = create_calendar()
+
+# Функция для получения соперника по текущему туру
+def get_opponent_by_round(player_club, current_round):
+    if current_round > len(MATCH_CALENDAR):
+        # Если турнир закончен, начинаем новый
+        current_round = 1
+    match = MATCH_CALENDAR[current_round - 1]
+    if match[0] == player_club:
+        return match[1]
+    elif match[1] == player_club:
+        return match[0]
+    return None
 
 @dp.callback_query(lambda c: c.data == "play_match")
 async def play_match_callback(callback: types.CallbackQuery, state: FSMContext):
@@ -413,7 +498,7 @@ async def play_match_callback(callback: types.CallbackQuery, state: FSMContext):
     
     can_play, message = await can_play_match(callback.from_user.id)
     if not can_play:
-        await callback.message.answer(message, reply_markup=get_main_keyboard())
+        await callback.message.answer(message)
         return
     
     player = await get_player(callback.from_user.id)
@@ -424,7 +509,7 @@ async def play_match_callback(callback: types.CallbackQuery, state: FSMContext):
         )
         return
     
-    if not player.is_in_squad:  # is_in_squad
+    if not player.is_in_squad:
         await callback.message.answer(
             "❌ Вы не в заявке на матч\n"
             "Тренер решил не включать вас в состав на этот матч.\n"
@@ -433,11 +518,27 @@ async def play_match_callback(callback: types.CallbackQuery, state: FSMContext):
         )
         return
     
-    # Выбираем случайного соперника из ФНЛ Серебро
-    opponent = random.choice([club for club in FNL_SILVER_CLUBS.keys() if club != player.club])
-    
-    # Получаем текущий тур и виртуальную дату
+    # Получаем соперника по календарю
     current_round = player.current_round if player.matches > 0 else 1
+    opponent = get_opponent_by_round(player.club, current_round)
+    
+    if not opponent:
+        await callback.message.answer(
+            "❌ В этом туре у вас нет матча.\n"
+            "Попробуйте позже.",
+            reply_markup=InlineKeyboardMarkup(inline_keyboard=[
+                [InlineKeyboardButton(text="🏠 Вернуться в меню", callback_data="return_to_menu")]
+            ])
+        )
+        new_date = await advance_virtual_date(player)
+        await update_player_stats(
+            user_id=callback.from_user.id,
+            last_match_date=new_date,
+            current_round=player.current_round + 1  # Переходим к следующему туру
+        )
+        return
+    
+    # Получаем виртуальную дату
     match_date = (await get_virtual_date(player)).strftime("%d.%m.%Y")
     
     # Очищаем предыдущее состояние матча
@@ -457,7 +558,7 @@ async def play_match_callback(callback: types.CallbackQuery, state: FSMContext):
         'round': current_round,
         'date': match_date,
         'position': player.position,
-        'is_opponent_attack': player.position in ["Вратарь", "Защитник"],  # Для вратаря и защитника сразу начинаем с атаки соперника
+        'is_opponent_attack': player.position in ["Вратарь", "Защитник"],
         'stats': {
             'goals': 0,
             'assists': 0,
@@ -753,9 +854,9 @@ def get_defender_defense_keyboard():
 
 def get_defender_after_defense_keyboard():
     return InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(text="⬅️ Отдать влево", callback_data="defense_pass_left")],
+        [InlineKeyboardButton(text="⬅️ Отдать влево", callback_data="action_pass_left")],
         [InlineKeyboardButton(text="⚽ Выбить", callback_data="defense_clear")],
-        [InlineKeyboardButton(text="➡️ Отдать вправо", callback_data="defense_pass_right")]
+        [InlineKeyboardButton(text="➡️ Отдать вправо", callback_data="action_pass_right")]
     ])
 
 async def handle_defender_tackle(callback: types.CallbackQuery, match_state, state: FSMContext):
@@ -933,13 +1034,24 @@ async def handle_defender_clearance(callback: types.CallbackQuery, match_state, 
         await asyncio.sleep(3)
         
         if random.random() < 0.7:
-            match_state['stats']['clearances'] += 1
-            await send_photo_with_text(
-                callback.message,
-                'defense',
-                'clear_success.jpg',
-                "✅ Мяч выбит!\n- Защитник выбил мяч из опасной зоны"
-            )
+            # Добавляем шанс случайного гола при выбивании мяча
+            if random.random() < 0.05:  # 5% шанс случайного гола
+                match_state['your_goals'] += 1
+                match_state['stats']['goals'] += 1
+                await send_photo_with_text(
+                    callback.message,
+                    'goals',
+                    'goal.jpg',
+                    f"⚽ ГООООЛ!\n- Невероятно! Защитник случайно забил гол! Счёт: {match_state['your_goals']}-{match_state['opponent_goals']}"
+                )
+            else:
+                match_state['stats']['clearances'] += 1
+                await send_photo_with_text(
+                    callback.message,
+                    'defense',
+                    'clear_success.jpg',
+                    "✅ Мяч выбит!\n- Защитник выбил мяч из опасной зоны"
+                )
         else:
             await send_photo_with_text(
                 callback.message,
@@ -965,7 +1077,7 @@ async def handle_forward_shot(callback: types.CallbackQuery, match_state, state:
         )
         await asyncio.sleep(3)
         
-        if random.random() < 0.4:
+        if random.random() < 0.25:  # Уменьшаем шанс гола с 0.4 до 0.25
             match_state['your_goals'] += 1
             match_state['stats']['goals'] += 1
             await send_photo_with_text(
@@ -1007,6 +1119,11 @@ async def handle_forward_pass(callback: types.CallbackQuery, match_state, state:
                 'success.jpg',
                 "✅ Отличный пас!\n- Партнер получил мяч в выгодной позиции"
             )
+            # После успешного паса предлагаем продолжить атаку
+            await callback.message.answer(
+                "Выберите следующее действие:",
+                reply_markup=get_match_actions_keyboard('forward', is_second_phase=True)
+            )
         else:
             await send_photo_with_text(
                 callback.message,
@@ -1015,8 +1132,7 @@ async def handle_forward_pass(callback: types.CallbackQuery, match_state, state:
                 "❌ Пас перехвачен\n- Соперник перехватил передачу"
             )
             await simulate_opponent_attack(callback, match_state)
-        
-        await continue_match(callback, match_state, state)
+            await continue_match(callback, match_state, state)
     finally:
         # Сбрасываем флаг обработки в любом случае
         match_state['is_processing'] = False
@@ -1039,6 +1155,11 @@ async def handle_forward_dribble(callback: types.CallbackQuery, match_state, sta
                 'success.jpg',
                 "✅ Отличный дриблинг!\n- Нападающий обыграл защитника"
             )
+            # После успешного дриблинга предлагаем продолжить атаку
+            await callback.message.answer(
+                "Выберите следующее действие:",
+                reply_markup=get_match_actions_keyboard('forward', is_second_phase=True)
+            )
         else:
             await send_photo_with_text(
                 callback.message,
@@ -1047,8 +1168,7 @@ async def handle_forward_dribble(callback: types.CallbackQuery, match_state, sta
                 "❌ Потеря мяча\n- Защитник отобрал мяч"
             )
             await simulate_opponent_attack(callback, match_state)
-        
-        await continue_match(callback, match_state, state)
+            await continue_match(callback, match_state, state)
     finally:
         # Сбрасываем флаг обработки в любом случае
         match_state['is_processing'] = False
@@ -1212,17 +1332,17 @@ async def finish_match(callback: types.CallbackQuery, state: FSMContext):
     new_date = await advance_virtual_date(player)
     
     await update_player_stats(
-        callback.from_user.id, 
-        matches, 
-        wins, 
-        draws, 
-        losses,
-        match_state['stats']['goals'],
-        match_state['stats']['assists'],
-        match_state['stats']['saves'],
-        match_state['stats']['tackles'],
-        current_round,
-        new_date  # Используем новую дату
+        user_id=callback.from_user.id,
+        matches=matches,
+        wins=wins,
+        draws=draws,
+        losses=losses,
+        goals=match_state['stats']['goals'],
+        assists=match_state['stats']['assists'],
+        saves=match_state['stats']['saves'],
+        tackles=match_state['stats']['tackles'],
+        current_round=current_round,
+        last_match_date=new_date
     )
     
     stats = (f"{result_emoji} Матч завершен! Вы {result}!\n"
@@ -1499,6 +1619,14 @@ async def reset_player_stats(user_id):
         )
         await session.commit()
 
+async def delete_player(user_id):
+    """Удаляет игрока из базы данных"""
+    async with AsyncSessionLocal() as session:
+        await session.execute(
+            delete(Player).where(Player.user_id == user_id)
+        )
+        await session.commit()
+
 @dp.message(Command("reset_stats"))
 async def cmd_reset_stats(message: types.Message, state: FSMContext):
     # Проверяем, не идет ли сейчас матч
@@ -1565,7 +1693,7 @@ def get_transfer_offers(player):
     position = player.position
     offers = []
     # Переход из топ Серебра в середняк Золота
-    if club in TOP_SILVER and matches >= 10 and (goals >= 5 or assists >= 5 or saves >= 5 or tackles >= 5):
+    if club in TOP_SILVER and matches >= 10 and (goals >= 5 or assists >= 5 or saves >= 40 or tackles >= 25):
         offers = random.sample(MID_GOLD, 2)
         return 'gold', offers
     # Переход внутри Серебра (вверх)
@@ -1598,9 +1726,85 @@ async def transfer_callback(callback: types.CallbackQuery, state: FSMContext):
     await callback.message.answer(f"Вы успешно перешли в клуб {club} ({'ФНЛ Золото' if league == 'gold' else 'ФНЛ Серебро'})! Поздравляем!", reply_markup=get_main_keyboard())
     await callback.answer()
 
+@dp.message(Command("delete_player"))
+async def cmd_delete_player(message: types.Message, state: FSMContext):
+    # Проверяем, не идет ли сейчас матч
+    data = await state.get_data()
+    if data.get('match_state'):
+        await message.answer(
+            "❌ Сейчас идет матч! Дождитесь его завершения.",
+            reply_markup=get_main_keyboard()
+        )
+        return
+    
+    # Проверяем, существует ли игрок
+    player = await get_player(message.from_user.id)
+    if not player:
+        await message.answer(
+            "❌ Игрок не найден в базе данных.",
+            reply_markup=get_main_keyboard()
+        )
+        return
+    
+    # Создаем клавиатуру с подтверждением
+    keyboard = InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="✅ Да, удалить", callback_data="confirm_delete")],
+        [InlineKeyboardButton(text="❌ Нет, отмена", callback_data="cancel_delete")]
+    ])
+    
+    await message.answer(
+        f"⚠️ Вы уверены, что хотите удалить игрока?\n\n"
+        f"Имя: {player.name}\n"
+        f"Позиция: {player.position}\n"
+        f"Клуб: {player.club}\n\n"
+        f"Вся статистика будет удалена без возможности восстановления.",
+        reply_markup=keyboard
+    )
+
+@dp.callback_query(lambda c: c.data == "confirm_delete")
+async def confirm_delete_callback(callback: types.CallbackQuery, state: FSMContext):
+    await delete_player(callback.from_user.id)
+    await callback.message.edit_text(
+        "✅ Игрок успешно удален!\n"
+        "Используйте команду /start для создания нового игрока."
+    )
+    await callback.answer()
+
+@dp.callback_query(lambda c: c.data == "cancel_delete")
+async def cancel_delete_callback(callback: types.CallbackQuery, state: FSMContext):
+    await callback.message.edit_text(
+        "❌ Удаление игрока отменено.\n"
+        "Ваши данные сохранены."
+    )
+    await callback.answer()
+
 async def main():
     await init_db()  # Инициализация базы данных при запуске
     await dp.start_polling(bot)
+
+@dp.message(Command("admin_delete_player"))
+async def cmd_admin_delete_player(message: types.Message, state: FSMContext):
+    # Проверяем, является ли пользователь администратором
+    if message.from_user.id != 5259325234:  # Только для вас
+        await message.answer("❌ У вас нет прав для выполнения этой команды.")
+        return
+    
+    # Получаем ID игрока из аргументов команды
+    try:
+        user_id = int(message.text.split()[1])
+    except (IndexError, ValueError):
+        await message.answer("❌ Укажите ID игрока: /admin_delete_player <ID>")
+        return
+    
+    # Проверяем, существует ли игрок
+    player = await get_player(user_id)
+    if not player:
+        await message.answer(f"❌ Игрок с ID {user_id} не найден в базе данных.")
+        return
+    
+    # Удаляем игрока
+    await delete_player(user_id)
+    await message.answer(f"✅ Игрок {player.name} (ID: {user_id}) успешно удален из базы данных.")
 
 if __name__ == "__main__":
     asyncio.run(main())
