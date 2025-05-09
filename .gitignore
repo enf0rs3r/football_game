@@ -37,4 +37,6 @@ ENV/
 *.log
 *.sqlite3
 *.db
-football_game.db 
+football_game.db
+id.py
+old_bot.py
