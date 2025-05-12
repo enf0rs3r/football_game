@@ -12,17 +12,23 @@ from aiogram.fsm.state import State, StatesGroup
 from datetime import datetime, timedelta
 from dotenv import load_dotenv
 from sqlalchemy import text
+from aiogram.exceptions import TelegramBadRequest
+from typing import Optional
 
 # Настройка логирования
 logging.basicConfig(
     level=logging.INFO,
-    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
+    format='%(asctime)s - %(levelname)s - %(message)s',
     handlers=[
         logging.FileHandler('bot.log', encoding='utf-8'),
         logging.StreamHandler()
     ]
 )
 logger = logging.getLogger(__name__)
+
+# Отключаем лишние логи от aiogram
+logging.getLogger('aiogram').setLevel(logging.WARNING)
+logging.getLogger('asyncio').setLevel(logging.WARNING)
 
 load_dotenv()
 
@@ -35,9 +41,10 @@ from sqlalchemy.orm import sessionmaker, declarative_base
 from sqlalchemy import Column, BigInteger, String, Integer, Boolean, select, update, delete
 
 # Строка подключения к PostgreSQL
-
 engine = create_async_engine(DATABASE_URL, echo=False)
 AsyncSessionLocal = sessionmaker(engine, expire_on_commit=False, class_=AsyncSession)
+async_session = AsyncSessionLocal  # Добавляем алиас для совместимости
+
 Base = declarative_base()
 
 class Player(Base):
@@ -58,17 +65,14 @@ class Player(Base):
     current_round = Column(Integer, default=1)
     last_match_date = Column(String)
     personal_calendar = Column(String)  # JSON строка с календарем игрока
+    admin_selected_player_id = Column(BigInteger, nullable=True)  # ID выбранного игрока для админ-панели
 
 # --- Асинхронные функции работы с БД ---
 async def get_player(user_id):
     try:
-        async with AsyncSessionLocal() as session:
+        async with async_session() as session:
             result = await session.execute(select(Player).where(Player.user_id == user_id))
             player = result.scalar_one_or_none()
-            if player:
-                logger.debug(f"Получен игрок {player.name} (ID: {user_id})")
-            else:
-                logger.debug(f"Игрок с ID {user_id} не найден")
             return player
     except Exception as e:
         logger.error(f"Ошибка при получении игрока {user_id}: {e}")
@@ -76,52 +80,48 @@ async def get_player(user_id):
 
 async def create_player(user_id, name, position, club, start_date):
     try:
-        # Предварительно выполняем миграцию БД для обеспечения наличия необходимых столбцов
-        await migrate_database()
-        
-        # Создаем персональный календарь для игрока
-        calendar = create_player_calendar(club)
-        
-        # Создаем основные поля игрока (без personal_calendar, на случай если миграция не сработала)
         player_data = {
             "user_id": user_id,
-            "name": name, 
-            "position": position, 
+            "name": name,
+            "position": position,
             "club": club,
-            "last_match_date": start_date
+            "last_match_date": start_date,
+            "current_round": 1
         }
         
-        async with AsyncSessionLocal() as session:
-            # Пробуем добавить календарь, если миграция сработала
+        calendar = create_player_calendar(club)
+        if not calendar:
+            logger.error(f"Не удалось создать календарь для клуба {club}")
+            raise Exception("Ошибка создания календаря")
+        
+        async with async_session() as session:
             try:
                 player_data["personal_calendar"] = calendar
                 player = Player(**player_data)
                 session.add(player)
                 await session.commit()
-                logger.info(f"Создан новый игрок: {name} (ID: {user_id}, Позиция: {position}, Клуб: {club}, Дата начала: {start_date})")
+                logger.info(f"Создан новый игрок: {name} (ID: {user_id}, Позиция: {position}, Клуб: {club})")
+                return True
             except Exception as e:
-                # Если не удалось с календарем, пробуем без него
+                await session.rollback()
                 if "personal_calendar" in str(e).lower():
-                    logger.warning(f"Не удалось создать игрока с календарем, пробуем без календаря: {e}")
-                    await session.rollback()
-                    
-                    # Удаляем поле personal_calendar из данных
+                    logger.warning(f"Ошибка при сохранении календаря, пробуем создать игрока без него: {e}")
                     player_data.pop("personal_calendar", None)
                     player = Player(**player_data)
                     session.add(player)
                     await session.commit()
                     logger.info(f"Создан новый игрок без календаря: {name} (ID: {user_id}, Позиция: {position}, Клуб: {club})")
+                    return True
                 else:
-                    # Другая ошибка, пробрасываем дальше
+                    logger.error(f"Ошибка при создании игрока {name}: {e}")
                     raise
     except Exception as e:
-        logger.error(f"Ошибка при создании игрока {name} (ID: {user_id}): {e}")
+        logger.error(f"Критическая ошибка при создании игрока {name}: {e}")
         raise
 
 async def update_player_stats(user_id, **kwargs):
     try:
-        async with AsyncSessionLocal() as session:
-            # Сначала получаем текущие данные игрока
+        async with async_session() as session:
             result = await session.execute(select(Player).where(Player.user_id == user_id))
             player = result.scalar_one_or_none()
             
@@ -129,7 +129,6 @@ async def update_player_stats(user_id, **kwargs):
                 logger.warning(f"Попытка обновить несуществующего игрока {user_id}")
                 return False
             
-            # Создаем словарь с текущими статистическими данными
             current_stats = {
                 "goals": player.goals or 0,
                 "assists": player.assists or 0,
@@ -137,27 +136,20 @@ async def update_player_stats(user_id, **kwargs):
                 "tackles": player.tackles or 0
             }
             
-            # Обновляем данные игрока кумулятивно для статистических полей
             update_data = {}
             for key, value in kwargs.items():
                 if key in ['goals', 'assists', 'saves', 'tackles']:
-                    # Если переданное значение больше текущего, считаем что это новые данные для добавления
                     if value > current_stats.get(key, 0):
                         update_data[key] = current_stats.get(key, 0) + value
                     else:
-                        # Иначе просто устанавливаем новое значение
                         update_data[key] = value
                 else:
-                    # Для не-статистических полей просто устанавливаем новое значение
                     update_data[key] = value
             
-            # Выполняем обновление
             await session.execute(
                 update(Player).where(Player.user_id == user_id).values(**update_data)
             )
             await session.commit()
-            
-            logger.debug(f"Обновлена статистика игрока {user_id}: {update_data}")
             return True
     except Exception as e:
         logger.error(f"Ошибка при обновлении статистики игрока {user_id}: {e}")
@@ -181,60 +173,24 @@ async def update_player_squad_status(user_id, is_in_squad):
 
 # --- Инициализция базы ---
 async def migrate_database():
-    """Миграция базы данных: добавление столбца personal_calendar, если его не существует"""
-    try:
-        logger.info("Проверка и миграция базы данных...")
-        
-        # Проверяем, существует ли столбец personal_calendar в таблице players
-        async with engine.begin() as conn:
-            # Для PostgreSQL
-            check_query = text("""
-            SELECT column_name FROM information_schema.columns 
-            WHERE table_name = 'players' AND column_name = 'personal_calendar';
-            """)
-            result = await conn.execute(check_query)
-            column_exists = bool(result.scalar())
-            
-            if not column_exists:
-                logger.info("Столбец personal_calendar не найден, добавляем...")
-                # Добавляем столбец personal_calendar
-                alter_query = text("""
-                ALTER TABLE players ADD COLUMN personal_calendar TEXT;
-                """)
-                await conn.execute(alter_query)
-                
-                # Явно ждем завершения транзакции
-                await conn.commit()
-                
-                # Проверяем еще раз, что столбец действительно добавлен
-                result = await conn.execute(check_query)
-                column_exists = bool(result.scalar())
-                
-                if column_exists:
-                    logger.info("Столбец personal_calendar успешно добавлен в таблицу players")
-                else:
-                    logger.error("Не удалось добавить столбец personal_calendar!")
-                    raise Exception("Не удалось добавить столбец personal_calendar!")
-            else:
-                logger.info("Столбец personal_calendar уже существует")
-        
-        logger.info("Миграция базы данных успешно завершена")
-        return True
-    except Exception as e:
-        logger.error(f"Ошибка при миграции базы данных: {e}")
-        return False
+    """Миграция базы данных"""
+    async with async_session() as session:
+        # Добавляем поле admin_selected_player_id, если его нет
+        try:
+            await session.execute(text("""
+                ALTER TABLE players 
+                ADD COLUMN IF NOT EXISTS admin_selected_player_id BIGINT
+            """))
+            await session.commit()
+        except Exception as e:
+            print(f"Ошибка при миграции: {e}")
+            await session.rollback()
 
 async def init_db():
-    try:
-        async with engine.begin() as conn:
-            await conn.run_sync(Base.metadata.create_all)
-            logger.info("База данных успешно инициализирована")
-        
-        # Выполняем миграцию существующей базы данных
-        await migrate_database()
-    except Exception as e:
-        logger.error(f"Ошибка при инициализации базы данных: {e}")
-        raise
+    """Инициализация базы данных"""
+    async with engine.begin() as conn:
+        await conn.run_sync(Base.metadata.create_all)
+    await migrate_database()  # Выполняем миграцию после создания таблиц
 
 # --- Остальной код бота (пример для /start) ---
 # Замените на свой токен бота
@@ -245,6 +201,14 @@ class GameStates(StatesGroup):
     waiting_position = State()
     waiting_club_choice = State()
     playing = State()
+    # Добавляем новые состояния для админ-панели
+    admin_waiting_player_id = State()
+    admin_waiting_date_change = State()
+    admin_waiting_round_change = State()
+    admin_waiting_goals_change = State()
+    admin_waiting_assists_change = State()
+    admin_waiting_saves_change = State()
+    admin_waiting_tackles_change = State()
 
 # Список клубов ФНЛ Серебро
 FNL_SILVER_CLUBS = {
@@ -408,131 +372,170 @@ async def safe_sleep(seconds):
 
 @dp.message(Command("start"))
 async def cmd_start(message: types.Message, state: FSMContext):
-    logger.info(f"Пользователь {message.from_user.id} запустил команду /start")
-    
-    # Проверяем, не идет ли сейчас матч
-    data = await state.get_data()
-    if data.get('match_state'):
-        logger.warning(f"Пользователь {message.from_user.id} попытался использовать /start во время матча")
-        await message.answer(
-            "❌ Сейчас идет матч! Дождитесь его завершения."
-        )
-        return
-
-    if not await check_subscription(message.from_user.id):
-        logger.info(f"Пользователь {message.from_user.id} не подписан на канал")
-        await message.answer(
-            "Для использования бота необходимо подписаться на наш канал!",
-            reply_markup=get_subscription_keyboard()
-        )
-        return
-    
-    player = await get_player(message.from_user.id)
-    if player:
-        logger.info(f"Существующий игрок {player.name} (ID: {message.from_user.id}) вошел в игру")
-        await state.set_state(GameStates.playing)
-        welcome_text = (
-            f"👋 Привет, {player.name}!\n\n"
-            f"Вы играете за {player.club}\n"
-            f"Позиция: {player.position}\n"
-            f"{'✅ В стартовом составе' if player.is_in_squad else '❌ Не в заявке'}\n\n"
-            "Добро пожаловать в футбольный симулятор!\n"
-            "🏆 Побеждай в матчах\n"
-            "⭐ Стань легендой футбола!"
-        )
-        with open("mbappe.png", "rb") as file:
-            photo = BufferedInputFile(file.read(), filename="mbappe.png")
-            await message.answer_photo(
-                photo,
-                caption=welcome_text,
-                reply_markup=get_main_keyboard()
+    try:
+        # Сбрасываем все состояния
+        await state.clear()
+        
+        # Проверяем подписку
+        if not await check_subscription(message.from_user.id):
+            await message.answer(
+                "Для начала игры необходимо подписаться на наш канал!",
+                reply_markup=get_subscription_keyboard()
             )
-    else:
-        logger.info(f"Новый игрок (ID: {message.from_user.id}) начал регистрацию")
-        await message.answer("Добро пожаловать в виртуальную футбольную карьеру! Введите ваше имя:")
-        await state.set_state(GameStates.waiting_name)
-
-@dp.callback_query(lambda c: c.data == "check_subscription")
-async def check_subscription_callback(callback: types.CallbackQuery):
-    if await check_subscription(callback.from_user.id):
-        player = await get_player(callback.from_user.id)
+            return
+        
+        # Проверяем, существует ли уже игрок
+        player = await get_player(message.from_user.id)
         if player:
             welcome_text = (
                 f"👋 Привет, {player.name}!\n\n"
+                f"Вы играете за {player.club}\n"
+                f"Позиция: {player.position}\n"
+                f"{'✅ В стартовом составе' if player.is_in_squad else '❌ Не в заявке'}\n\n"
                 "Добро пожаловать в футбольный симулятор!\n"
                 "🏆 Побеждай в матчах\n"
                 "⭐ Стань легендой футбола!"
             )
-            with open("mbappe.png", "rb") as file:
-                photo = BufferedInputFile(file.read(), filename="mbappe.png")
-                await callback.message.answer_photo(
-                    photo,
-                    caption=welcome_text,
-                    reply_markup=get_main_keyboard()
-                )
+            try:
+                with open("mbappe.png", "rb") as file:
+                    photo = BufferedInputFile(file.read(), filename="mbappe.png")
+                    await message.answer_photo(
+                        photo,
+                        caption=welcome_text,
+                        reply_markup=get_main_keyboard()
+                    )
+            except Exception as photo_error:
+                logger.error(f"Ошибка при отправке фото: {photo_error}")
+                # Если не удалось отправить фото, отправляем только текст
+                await message.answer(welcome_text, reply_markup=get_main_keyboard())
         else:
-            await callback.message.edit_text("Спасибо за подписку! Теперь вы можете использовать бота.")
-            await callback.message.answer("Добро пожаловать в виртуальную футбольную карьеру! Введите ваше имя:")
-        try:
-            await callback.answer()
-        except Exception as e:
-            logger.debug(f"Не удалось ответить на callback: {e}")
+            await message.answer(
+                "Добро пожаловать в футбольный симулятор!\n"
+                "Для начала игры, введите ваше имя:"
+            )
+            await state.set_state(GameStates.waiting_name)
+    except Exception as e:
+        logger.error(f"Ошибка в cmd_start: {e}")
+        await message.answer(
+            "Произошла ошибка при запуске бота. Пожалуйста, попробуйте снова.",
+            reply_markup=get_main_keyboard()
+        )
+
+@dp.callback_query(lambda c: c.data == "check_subscription")
+async def check_subscription_callback(callback: types.CallbackQuery):
+    # Сбрасываем все состояния
+    state = dp.current_state(user=callback.from_user.id)
+    await state.clear()
+    
+    if await check_subscription(callback.from_user.id):
+        await callback.message.answer(
+            "✅ Спасибо за подписку! Теперь вы можете начать игру.",
+            reply_markup=get_main_keyboard()
+        )
     else:
-        await callback.answer("Вы все еще не подписаны на канал!", show_alert=True)
+        await callback.message.answer(
+            "❌ Вы все еще не подписаны на канал!",
+            reply_markup=get_subscription_keyboard()
+        )
+    await callback.answer()
 
 @dp.message(GameStates.waiting_name)
 async def process_name(message: types.Message, state: FSMContext):
-    logger.info(f"Пользователь {message.from_user.id} ввел имя: {message.text}")
-    
-    if not await check_subscription(message.from_user.id):
-        logger.warning(f"Пользователь {message.from_user.id} не подписан на канал при вводе имени")
+    try:
+        logger.info(f"Пользователь {message.from_user.id} ввел имя: {message.text}")
+        
+        if not await check_subscription(message.from_user.id):
+            logger.warning(f"Пользователь {message.from_user.id} не подписан на канал при вводе имени")
+            await message.answer(
+                "Для продолжения необходимо подписаться на наш канал!",
+                reply_markup=get_subscription_keyboard()
+            )
+            return
+
+        if not message.text or len(message.text.strip()) < 2:
+            await message.answer(
+                "Имя должно содержать минимум 2 символа. Попробуйте еще раз:"
+            )
+            return
+
+        await state.update_data(name=message.text)
+        await state.set_state(GameStates.waiting_position)
         await message.answer(
-            "Для продолжения необходимо подписаться на наш канал!",
-            reply_markup=get_subscription_keyboard()
+            "Выберите вашу позицию на поле:",
+            reply_markup=get_position_keyboard()
         )
-        return
-    await state.update_data(name=message.text)
-    await state.set_state(GameStates.waiting_position)
-    await message.answer(
-        "Выберите вашу позицию на поле:",
-        reply_markup=get_position_keyboard()
-    )
+    except Exception as e:
+        logger.error(f"Ошибка в process_name: {e}")
+        await message.answer(
+            "Произошла ошибка при обработке имени. Пожалуйста, попробуйте снова.",
+            reply_markup=get_main_keyboard()
+        )
+        await state.clear()
 
 @dp.callback_query(lambda c: c.data.startswith('position_'), GameStates.waiting_position)
 async def process_position(callback: types.CallbackQuery, state: FSMContext):
-    position_map = {
-        "position_gk": "Вратарь",
-        "position_def": "Защитник",
-        "position_fw": "Нападающий"
-    }
-    
-    position = position_map[callback.data]
-    user_data = await state.get_data()
-    name = user_data['name']
-    
-    logger.info(f"Игрок {name} (ID: {callback.from_user.id}) выбрал позицию: {position}")
-    
-    # Сохраняем позицию в состоянии
-    await state.update_data(position=position)
-    
-    # Получаем случайные предложения от клубов
-    offers = get_random_club_offers()
-    await state.update_data(offers=offers)
-    
-    await state.set_state(GameStates.waiting_club_choice)
-    await callback.message.answer(
-        f"Отлично, {name}! Вы выбрали позицию: {position}\n\n"
-        "Вам назначен ваш первый агент. Обращение от него:\nПоступили предложения от следующих клубов ФНЛ Серебро:\n\n"
-        f"1. {offers[0]}\n"
-        f"2. {offers[1]}\n"
-        f"3. {offers[2]}\n\n"
-        "Выберите клуб, в котором хотите начать карьеру:",
-        reply_markup=get_club_offers_keyboard(offers)
-    )
     try:
-        await callback.answer()
+        position_map = {
+            "position_gk": "Вратарь",
+            "position_def": "Защитник",
+            "position_fw": "Нападающий"
+        }
+        
+        if callback.data not in position_map:
+            logger.error(f"Неизвестная позиция: {callback.data}")
+            await callback.message.answer(
+                "Произошла ошибка при выборе позиции. Пожалуйста, попробуйте снова.",
+                reply_markup=get_main_keyboard()
+            )
+            return
+
+        position = position_map[callback.data]
+        user_data = await state.get_data()
+        name = user_data.get('name')
+        
+        if not name:
+            logger.error("Отсутствует имя игрока при выборе позиции")
+            await callback.message.answer(
+                "Произошла ошибка. Пожалуйста, начните сначала.",
+                reply_markup=get_main_keyboard()
+            )
+            await state.clear()
+            return
+        
+        logger.info(f"Игрок {name} (ID: {callback.from_user.id}) выбрал позицию: {position}")
+        
+        # Сохраняем позицию в состоянии
+        await state.update_data(position=position)
+        
+        # Получаем случайные предложения от клубов
+        offers = get_random_club_offers()
+        if not offers or len(offers) < 3:
+            logger.error("Не удалось получить предложения клубов")
+            await callback.message.answer(
+                "Произошла ошибка при получении предложений клубов. Пожалуйста, попробуйте снова.",
+                reply_markup=get_main_keyboard()
+            )
+            return
+
+        await state.update_data(offers=offers)
+        
+        await state.set_state(GameStates.waiting_club_choice)
+        await callback.message.answer(
+            f"Отлично, {name}! Вы выбрали позицию: {position}\n\n"
+            "Вам назначен ваш первый агент. Обращение от него:\nПоступили предложения от следующих клубов ФНЛ Серебро:\n\n"
+            f"1. {offers[0]}\n"
+            f"2. {offers[1]}\n"
+            f"3. {offers[2]}\n\n"
+            "Выберите клуб, в котором хотите начать карьеру:",
+            reply_markup=get_club_offers_keyboard(offers)
+        )
     except Exception as e:
-        logger.debug(f"Не удалось ответить на callback: {e}")
+        logger.error(f"Ошибка в process_position: {e}")
+        await callback.message.answer(
+            "Произошла ошибка при выборе позиции. Пожалуйста, попробуйте снова.",
+            reply_markup=get_main_keyboard()
+        )
+        await state.clear()
 
 def get_initial_player_date():
     """Определяет начальную дату для нового игрока"""
@@ -542,55 +545,76 @@ def get_initial_player_date():
 @dp.callback_query(lambda c: c.data.startswith('choose_club_'), GameStates.waiting_club_choice)
 async def process_club_choice(callback_query: types.CallbackQuery, state: FSMContext):
     try:
-        # Получаем название клуба из callback data
+        # Получаем выбранный клуб
         club = callback_query.data.replace('choose_club_', '')
-        user_id = callback_query.from_user.id
+        logger.info(f"Игрок выбрал клуб: {club}")
         
-        # Получаем данные из состояния
+        # Получаем сохраненные данные
         data = await state.get_data()
         name = data.get('name')
         position = data.get('position')
         
-        # Определяем начальную дату для игрока
+        if not name or not position:
+            logger.error(f"Отсутствуют данные игрока: name={name}, position={position}")
+            await callback_query.message.answer(
+                "Ошибка: не удалось получить данные игрока. Пожалуйста, начните сначала.",
+                reply_markup=get_main_menu_keyboard()
+            )
+            return
+        
+        # Получаем начальную дату
         start_date = get_initial_player_date()
+        logger.info(f"Создание игрока: {name}, позиция: {position}, клуб: {club}, дата: {start_date}")
         
-        # Создаем игрока
-        await create_player(user_id, name, position, club, start_date)
-        
-        # Очищаем состояние и устанавливаем режим игры
-        await state.clear()
-        await state.set_state(GameStates.playing)
-        
-        # Отправляем приветственное сообщение
-        welcome_text = (
-            f"Добро пожаловать в футбольный симулятор, {name}!\n\n"
-            f"Вы зарегистрированы как {position} в клубе {club}.\n"
-            f"Дата начала карьеры: {datetime.strptime(start_date, '%d.%m.%Y').strftime('%d.%m.%Y')}\n\n"
-            "Используйте кнопку 'Играть матч' для начала игры или 'Статистика' для просмотра своих достижений."
-        )
-        
-        await callback_query.message.edit_text(
-            welcome_text,
-            reply_markup=None
-        )
-        
-        # Отправляем главное меню отдельным сообщением
+        try:
+            # Создаем игрока
+            await create_player(callback_query.from_user.id, name, position, club, start_date)
+            logger.info(f"Игрок успешно создан: {name}")
+            
+            # Сбрасываем все состояния
+            await state.clear()
+            
+            # Создаем персональный календарь
+            calendar = create_player_calendar(club)
+            await update_player_stats(callback_query.from_user.id, personal_calendar=calendar)
+            logger.info(f"Создан календарь для игрока {name}")
+            
+            # Отправляем приветственное сообщение
+            welcome_text = (
+                f"👋 Привет, {name}!\n\n"
+                f"Вы играете за {club}\n"
+                f"Позиция: {position}\n"
+                "✅ В стартовом составе\n\n"
+                "Добро пожаловать в футбольный симулятор!\n"
+                "🏆 Побеждай в матчах\n"
+                "⭐ Стань легендой футбола!"
+            )
+            
+            with open("mbappe.png", "rb") as file:
+                photo = BufferedInputFile(file.read(), filename="mbappe.png")
+                await callback_query.message.answer_photo(
+                    photo,
+                    caption=welcome_text,
+                    reply_markup=get_main_menu_keyboard()
+                )
+            logger.info(f"Отправлено приветственное сообщение игроку {name}")
+            
+        except Exception as e:
+            logger.error(f"Ошибка при создании игрока {name}: {e}")
+            await callback_query.message.answer(
+                "Произошла ошибка при создании игрока. Пожалуйста, попробуйте снова.",
+                reply_markup=get_main_menu_keyboard()
+            )
+            # Сбрасываем состояние, чтобы можно было начать заново
+            await state.clear()
+            
+    except Exception as e:
+        logger.error(f"Неожиданная ошибка в process_club_choice: {e}")
         await callback_query.message.answer(
-            "Выберите действие:",
-            reply_markup=get_main_keyboard()
+            "Произошла непредвиденная ошибка. Пожалуйста, попробуйте снова.",
+            reply_markup=get_main_menu_keyboard()
         )
-        logger.info(f"Игрок {name} (ID: {user_id}) успешно зарегистрирован в клубе {club}")
-        
-    except Exception as e:
-        logger.error(f"Ошибка при выборе клуба: {e}")
-        await callback_query.message.edit_text(
-            "Произошла ошибка при регистрации. Пожалуйста, попробуйте снова через /start",
-            reply_markup=None
-        )
-    try:
-        await callback_query.answer()
-    except Exception as e:
-        logger.debug(f"Не удалось ответить на callback: {e}")
+        await state.clear()
 
 async def get_virtual_date(player):
     """Получает виртуальную дату игрока в формате DD.MM.YYYY"""
@@ -653,7 +677,7 @@ def is_winter_break(virtual_date):
         return False
 
 async def can_play_match(player, in_day=False):
-    """Проверяет, может ли игрок сыграть матч, с учетом текущей виртуальной даты и зимнего перерыва"""
+    """Проверяет, может ли игрок сыграть матч, с учетом только виртуальной даты и зимнего перерыва"""
     try:
         # Проверяем, не находится ли текущая дата в зимнем перерыве
         if is_winter_break(player.last_match_date):
@@ -669,17 +693,16 @@ async def can_play_match(player, in_day=False):
             await start_new_season(player)
             return True, "Начинается новый сезон! Приготовьтесь к первому матчу! 🏆"
         
-        # Если в этот день игрок уже сыграл матч (для защиты от повторов)
-        if in_day and player.last_match_day == datetime.now().strftime("%Y-%m-%d"):
-            return False, "Вы уже сыграли матч сегодня. Следующий матч будет доступен завтра! ⏰"
-        
+        # Удаляем проверку по реальной дате: if in_day and player.last_match_day == datetime.now().strftime("%Y-%m-%d")
+        # Теперь ограничение только по виртуальной дате (например, если нужно, можно сравнивать last_match_date с датой последнего сыгранного тура)
+        # Но если не требуется ограничение по дню, просто пропускаем
         return True, ""
     except Exception as e:
         logger.error(f"Ошибка при проверке возможности сыграть матч: {e}")
         return False, "Произошла ошибка. Попробуйте позже."
 
 async def advance_virtual_date(player):
-    """Увеличивает виртуальную дату на 7 дней, с учетом зимнего перерыва и смены года"""
+    """Увеличивает виртуальную дату на 7 дней, с учетом зимнего перерыва и смены года. Новый сезон только после мая."""
     try:
         # Определяем формат даты и парсим текущую дату
         if "-" in player.last_match_date:
@@ -710,23 +733,20 @@ async def advance_virtual_date(player):
             else:
                 # Если уже в начале года, просто переходим на март
                 new_date = datetime(new_date.year, WINTER_BREAK_END, 1)
+            # После зимнего перерыва сезон продолжается, не вызываем start_new_season
         
-        # Проверяем, не закончился ли сезон
+        # Проверяем, не закончился ли сезон (после мая)
         if (current_date.month < SEASON_END_MONTH or 
             (current_date.month == SEASON_END_MONTH and current_date.day < 25)) and \
            (new_date.month > SEASON_END_MONTH or 
             (new_date.month == SEASON_END_MONTH and new_date.day >= 25)):
             logger.info(f"Сезон закончился для игрока {player.name}")
-            
             # Генерируем предложения о переходе
             await generate_transfer_offers(player)
-            
             # Переходим на следующий сезон (сентябрь)
-            if current_date.month == SEASON_END_MONTH:  # Май
-                # Переходим сразу на сентябрь того же года (начало нового сезона)
-                new_date = datetime(new_date.year, SEASON_START_MONTH, 1)
-                # Создаем новый календарь для следующего сезона
-                await start_new_season(player)
+            new_date = datetime(new_date.year, SEASON_START_MONTH, 1)
+            # Создаем новый календарь для следующего сезона
+            await start_new_season(player)
         
         # Форматируем новую дату для сохранения
         virtual_date = new_date.strftime("%d.%m.%Y")
@@ -746,21 +766,46 @@ async def advance_virtual_date(player):
 async def get_opponent_by_round(player, current_round):
     """Получает соперника по текущему туру из персонального календаря игрока"""
     try:
+        if not player:
+            logger.error("Передан пустой объект игрока")
+            return None
+            
         # Проверяем наличие календаря
         if not hasattr(player, 'personal_calendar') or not player.personal_calendar:
             logger.warning(f"У игрока {player.name} (ID: {player.user_id}) отсутствует календарь, создаем новый")
             # Создаем новый календарь
             calendar_json = create_player_calendar(player.club)
+            if not calendar_json:
+                logger.error(f"Не удалось создать календарь для клуба {player.club}")
+                return None
+                
             # Сохраняем календарь в базу
+            try:
+                await update_player_stats(
+                    user_id=player.user_id,
+                    personal_calendar=calendar_json
+                )
+            except Exception as e:
+                logger.error(f"Ошибка при сохранении календаря: {e}")
+                return None
+                
+            # Используем обычного соперника до следующего обновления
+            return get_opponent_by_round_default(player.club, current_round)
+        
+        try:
+            # Парсим JSON календарь
+            calendar = json.loads(player.personal_calendar)
+        except json.JSONDecodeError as e:
+            logger.error(f"Ошибка при парсинге календаря игрока {player.name}: {e}")
+            # Создаем новый календарь при ошибке парсинга
+            calendar_json = create_player_calendar(player.club)
+            if not calendar_json:
+                return None
             await update_player_stats(
                 user_id=player.user_id,
                 personal_calendar=calendar_json
             )
-            # Используем обычного соперника до следующего обновления
             return get_opponent_by_round_default(player.club, current_round)
-        
-        # Парсим JSON календарь
-        calendar = json.loads(player.personal_calendar)
         
         # Проверяем, не вышли ли за пределы календаря (18 туров)
         if current_round > 18:
@@ -785,7 +830,7 @@ async def get_opponent_by_round(player, current_round):
         logger.warning(f"Для клуба {player.club} в туре {current_round} не найден соперник в календаре - выбран случайный клуб {random_opponent}")
         return random_opponent
     except Exception as e:
-        logger.error(f"Ошибка при получении соперника из календаря: {e}")
+        logger.error(f"Критическая ошибка при получении соперника из календаря: {e}")
         # В случае ошибки используем обычный способ
         return get_opponent_by_round_default(player.club, current_round)
 
@@ -951,227 +996,140 @@ def get_opponent_by_round_default(player_club, current_round):
     return None
 
 @dp.callback_query(lambda c: c.data == "play_match")
-async def play_match_callback(callback: types.CallbackQuery, state: FSMContext):
-    """Обработчик начала матча"""
+async def play_match_callback(callback_query: types.CallbackQuery, state: FSMContext):
+    """Обработчик нажатия кнопки 'Играть матч'"""
     try:
-        logger.info(f"Пользователь {callback.from_user.id} начал матч")
+        user_id = callback_query.from_user.id
         
-        # Получаем данные игрока
-        player = await get_player(callback.from_user.id)
-        if not player:
-            await callback.message.answer(
-                "Вы не зарегистрированы. Используйте команду /start для создания игрока."
-            )
-            await callback.answer()
+        # Проверяем, не идет ли уже матч
+        match_state = await state.get_data()
+        if match_state.get('match_in_progress'):
+            logger.warning(f"Попытка начать матч во время активной игры (user_id: {user_id})")
+            await callback_query.answer("У вас уже идет матч!")
             return
             
-        # Проверяем, может ли игрок сейчас сыграть матч
-        can_play, message = await can_play_match(player)
-        if not can_play:
-            await callback.message.answer(message)
-            await callback.answer()
+        # Получаем данные игрока
+        player = get_player(user_id)
+        if not player:
+            logger.error(f"Игрок не найден для пользователя {user_id}")
+            await callback_query.answer("Ошибка: игрок не найден")
             return
+            
+        # Проверяем, может ли игрок играть матч
+        can_play, reason = can_play_match(player)
+        if not can_play:
+            logger.warning(f"Игрок {player.name} не может начать матч: {reason}")
+            await callback_query.answer(reason)
+            return
+            
+        # Определяем текущий тур
+        current_round = player.current_round
+        logger.info(f"Начало матча для игрока {player.name} (тур {current_round})")
         
-        # Определяем текущий тур игрока
-        current_round = player.current_round if player.matches > 0 else 1
-        
-        # Получаем соперника из персонального календаря
-        opponent = await get_opponent_by_round(player, current_round)
-        
-        # Если оппонент не найден (конец сезона), перенаправляем на новый сезон
+        # Получаем соперника
+        opponent = get_opponent_by_round(player, current_round)
         if not opponent:
-            # Создаем новый сезон
-            success = await start_new_season(player)
-            if success:
-                # Получаем обновленные данные игрока
-                player = await get_player(callback.from_user.id)
-                current_round = 1
-                opponent = await get_opponent_by_round(player, current_round)
-            else:
-                await callback.message.answer("Ошибка при создании нового сезона. Пожалуйста, попробуйте снова.")
-                await callback.answer()
+            logger.info(f"Сезон закончен для игрока {player.name}, начинаем новый сезон")
+            if not await start_new_season(player):
+                logger.error(f"Не удалось начать новый сезон для игрока {player.name}")
+                await callback_query.answer("Ошибка при начале нового сезона")
                 return
+                
+            # Получаем обновленные данные игрока после начала нового сезона
+            player = get_player(user_id)
+            if not player:
+                logger.error(f"Игрок не найден после начала нового сезона (user_id: {user_id})")
+                await callback_query.answer("Ошибка: игрок не найден")
+                return
+                
+            # Получаем соперника для нового сезона
+            opponent = get_opponent_by_round(player, 1)
+            if not opponent:
+                logger.error(f"Не удалось получить соперника для нового сезона (user_id: {user_id})")
+                await callback_query.answer("Ошибка: не удалось получить соперника")
+                return
+                
+            current_round = 1
+            
+        # Определяем, домашний матч или гостевой
+        is_home = opponent['home_team'] == player.club
         
-        # Проверяем, домашний или выездной матч
-        is_home = True  # По умолчанию домашний
-        
-        # Пытаемся получить информацию о домашнем/выездном из календаря
-        try:
-            calendar = json.loads(player.personal_calendar)
-            for match in calendar:
-                if match["round"] == current_round:
-                    is_home = match["is_home"]
-                    break
-        except Exception as e:
-            logger.error(f"Ошибка при получении информации о домашнем/выездном матче: {e}")
-        
-        # Определяем текущую и следующую команды
-        if is_home:
-            current_team = player.club
-            opponent_team = opponent
-        else:
-            current_team = opponent
-            opponent_team = player.club
-        
-        # Логируем начало матча
-        logger.info(f"Начался матч: {player.club} vs {opponent} (Тур {current_round})")
-        
-        # Сохраняем состояние матча
+        # Инициализируем состояние матча
         match_state = {
-            "your_goals": 0,
-            "opponent_goals": 0,
-            "current_team": current_team,
-            "opponent_team": opponent_team,
-            "current_round": current_round,
-            "is_home": is_home,
-            "last_message_id": None,
-            "stats": {
-                "goals": 0,
-                "assists": 0,
-                "saves": 0,
-                "tackles": 0,
-                "fouls": 0,
-                "passes": 0,
-                "interceptions": 0
+            'match_in_progress': True,
+            'current_team': player.club,
+            'opponent_team': opponent['away_team'] if is_home else opponent['home_team'],
+            'current_round': current_round,
+            'position': player.position,
+            'minute': 0,
+            'score': {'home': 0, 'away': 0},
+            'stats': {
+                'shots': {'home': 0, 'away': 0},
+                'shots_on_target': {'home': 0, 'away': 0},
+                'possession': {'home': 50, 'away': 50},
+                'passes': {'home': 0, 'away': 0},
+                'fouls': {'home': 0, 'away': 0},
+                'corners': {'home': 0, 'away': 0}
             },
-            "position": player.position,
-            "virtual_date": player.last_match_date
+            'opponent_attacks': player.position == 'GK'  # Флаг для атак соперника
         }
         
-        await state.update_data(match_state=match_state)
+        # Сохраняем состояние матча
+        await state.update_data(**match_state)
         
         # Начинаем матч
-        message = await callback.message.answer(
-            f"🏆 <b>Тур {current_round}</b>\n"
-            f"{'🏠' if is_home else '🚌'} <b>{current_team}</b> vs <b>{opponent_team}</b>\n\n"
-            "Матч начинается! Приготовьтесь к игре...",
-            parse_mode="HTML"
-        )
+        await start_match(callback_query, state)
         
-        # Запоминаем ID этого сообщения
-        match_state["last_message_id"] = message.message_id
-        await state.update_data(match_state=match_state)
-        
-        # Запускаем игровой процесс
-        await start_match(message, match_state, state)
-        
-        await callback.answer()
     except Exception as e:
-        logger.error(f"Ошибка при начале матча: {e}")
-        await callback.message.answer("Произошла ошибка при начале матча. Пожалуйста, попробуйте снова.")
-        await callback.answer()
+        logger.error(f"Критическая ошибка в play_match_callback: {e}")
+        await callback_query.answer("Произошла ошибка при начале матча")
+        await state.clear()
 
 @dp.callback_query(lambda c: c.data.startswith('action_'))
 async def handle_action(callback: types.CallbackQuery, state: FSMContext):
-    data = await state.get_data()
-    match_state = data.get('match_state')
-    
-    if not match_state:
-        await callback.message.answer(
-            "Матч не начат или уже завершен. Нажмите 'Играть матч' для начала нового матча."
-        )
-        try:
-            await callback.answer("Матч не активен", show_alert=True)
-        except Exception as e:
-            logger.debug(f"Не удалось ответить на callback: {e}")
-        return
-    
-    # Проверяем, завершен ли матч
-    if match_state.get('match_finished', False):
-        await callback.message.answer(
-            "Матч уже завершен. Нажмите 'Играть матч' для начала нового матча."
-        )
-        try:
-            await callback.answer("Матч уже завершен", show_alert=True)
-        except Exception as e:
-            logger.debug(f"Не удалось ответить на callback: {e}")
-        return
-    
-    # Проверяем, что кнопка из последнего сообщения
-    if callback.message.message_id != match_state.get('last_message_id'):
-        try:
-            await callback.answer(
-                "Используйте кнопки из последнего сообщения ⬇️",
-                show_alert=True
-            )
-        except Exception as e:
-            logger.debug(f"Не удалось ответить на callback: {e}")
-        return
-    
-    # Проверяем, не превышено ли максимальное количество действий в матче
-    MAX_ACTIONS_PER_MATCH = 50  # Максимальное количество действий в одном матче
-    actions_count = match_state.get('actions_count', 0)
-    
-    if actions_count >= MAX_ACTIONS_PER_MATCH:
-        logger.warning(f"Пользователь {callback.from_user.id} превысил лимит действий в матче ({actions_count})")
-        
-        # Автоматически завершаем матч
-        await callback.message.answer(
-            "Достигнут лимит действий в матче. Матч будет автоматически завершен.",
-            reply_markup=None
-        )
-        
-        # Завершаем матч
-        await finish_match(callback, state)
-        return
-    
-    # Увеличиваем счетчик действий
-    match_state['actions_count'] = actions_count + 1
-    await state.update_data(match_state=match_state)
-    
-    # Проверяем, не обрабатывается ли уже момент
-    if match_state.get('is_processing', False):
-        try:
-            await callback.answer("Дождитесь завершения текущего момента", show_alert=True)
-        except Exception as e:
-            logger.debug(f"Не удалось ответить на callback: {e}")
-        return
-    
-    # Устанавливаем флаг обработки момента
-    match_state['is_processing'] = True
-    await state.update_data(match_state=match_state)
-    
     try:
-        action = callback.data.split('_')[1]
-        position = match_state['position']
+        data = await state.get_data()
+        match_state = data.get('match_state')
         
-        # Безопасный ответ на callback
-        try:
-            await callback.answer()
-        except Exception as e:
-            logger.debug(f"Не удалось ответить на callback: {e}")
+        if not match_state:
+            logger.warning(f"Попытка выполнить действие без активного матча (ID: {callback.from_user.id})")
+            await callback.message.answer(
+                "Матч не начат или уже завершен. Нажмите 'Играть матч' для начала нового матча."
+            )
+            return
         
-        if position == "Вратарь":
+        # Проверяем, завершен ли матч
+        if match_state.get('match_finished', False):
+            logger.info(f"Попытка выполнить действие в завершенном матче (ID: {callback.from_user.id})")
+            await callback.message.answer(
+                "Матч уже завершен. Нажмите 'Играть матч' для начала нового матча."
+            )
+            return
+        
+        # Получаем тип действия
+        action = callback.data.replace('action_', '')
+        logger.info(f"Игрок выполнил действие: {action} (минута: {match_state['minute']})")
+        
+        # Обрабатываем действие в зависимости от позиции
+        if match_state['position'] == "Вратарь":
             await handle_goalkeeper_save(callback, match_state, state)
-        elif position == "Защитник":
-            if action == "tackle":
-                await handle_defender_tackle(callback, match_state, state)
-            elif action == "block":
-                await handle_defender_block(callback, match_state, state)
-            elif action == "clear":
-                await handle_defender_clearance(callback, match_state, state)
-            elif action == "pass_left":
-                await handle_defender_pass_left(callback, match_state, state)
-            elif action == "pass_right":
-                await handle_defender_pass_right(callback, match_state, state)
-        else:  # Нападающий
+        elif match_state['position'] == "Защитник":
+            await handle_defense_action(callback, state)
+        elif match_state['position'] == "Нападающий":
             if action == "shot":
                 await handle_forward_shot(callback, match_state, state)
             elif action == "pass":
                 await handle_forward_pass(callback, match_state, state)
             elif action == "dribble":
                 await handle_forward_dribble(callback, match_state, state)
+        
+        # Увеличиваем счетчик действий
+        match_state['actions_count'] += 1
+        logger.debug(f"Количество действий в матче: {match_state['actions_count']}")
+        
     except Exception as e:
         logger.error(f"Ошибка при обработке действия: {e}")
-        match_state['is_processing'] = False
-        await state.update_data(match_state=match_state)
-        try:
-            await callback.answer("Произошла ошибка. Попробуйте еще раз.", show_alert=True)
-        except Exception as err:
-            logger.debug(f"Не удалось ответить на callback после ошибки: {err}")
-    finally:
-        match_state['is_processing'] = False
-        await state.update_data(match_state=match_state)
+        await callback.answer("Произошла ошибка. Попробуйте еще раз.")
 
 @dp.callback_query(lambda c: c.data.startswith('defense_'))
 async def handle_defense_action(callback: types.CallbackQuery, state: FSMContext):
@@ -1755,32 +1713,58 @@ async def handle_forward_shot(callback: types.CallbackQuery, match_state, state:
             
         await send_photo_with_text(
             callback.message,
-            'shot',
-            'start.jpg',
+            'attack',
+            'shot_start.jpg',
             f"⚽ {match_state['current_team']} с мячом\n- Нападающий готовится к удару"
         )
-        await asyncio.sleep(3)
+        await safe_sleep(2)
         
-        if random.random() < 0.25:  # Уменьшаем шанс гола с 0.4 до 0.25
-            match_state['your_goals'] += 1
-            match_state['stats']['goals'] = match_state['stats'].get('goals', 0) + 1
+        if random.random() < 0.7:  # 70% шанс на удар в створ
             await send_photo_with_text(
                 callback.message,
-                'goals',
-                'goal.jpg',
-                f"⚽ ГООООЛ!\n- Отличный удар! Счёт: {match_state['your_goals']}-{match_state['opponent_goals']}"
+                'attack',
+                'shot_on_target.jpg',
+                "🎯 Удар в створ!\n- Вратарь должен реагировать"
             )
-            # После гола сразу продолжаем матч
-            await continue_match(callback, match_state, state)
+            await safe_sleep(2)
+            
+            # 15% шанс гола
+            if random.random() < 0.15:
+                match_state['your_goals'] += 1
+                match_state['stats']['goals'] = match_state['stats'].get('goals', 0) + 1
+                await send_photo_with_text(
+                    callback.message,
+                    'goals',
+                    'goal.jpg',
+                    f"⚽ ГООООЛ!\n- Отличный удар! Счёт: {match_state['your_goals']}-{match_state['opponent_goals']}"
+                )
+            else:
+                await send_photo_with_text(
+                    callback.message,
+                    'defense',
+                    'save.jpg',
+                    "🖐️ Вратарь парировал удар!\n- Мяч в игре"
+                )
         else:
             await send_photo_with_text(
                 callback.message,
-                'shot',
-                'miss.jpg',
-                "❌ Удар мимо\n- Вратарь соперника отразил удар"
+                'attack',
+                'shot_miss.jpg',
+                "❌ Удар мимо ворот\n- Мяч ушел в аут"
             )
-            await simulate_opponent_attack(callback, match_state)
+        
+        await safe_sleep(1)
+        await simulate_opponent_attack(callback, match_state)
+        # Сохраняем состояние перед продолжением
+        await state.update_data(match_state=match_state)
+        await continue_match(callback, match_state, state)
+    except Exception as e:
+        logger.error(f"Ошибка в handle_forward_shot: {e}")
+        # Продолжаем матч в случае ошибки
+        try:
             await continue_match(callback, match_state, state)
+        except Exception as continue_error:
+            logger.error(f"Не удалось продолжить матч после ошибки: {continue_error}")
     finally:
         # Сбрасываем флаг обработки в любом случае
         match_state['is_processing'] = False
@@ -1811,7 +1795,7 @@ async def handle_forward_pass(callback: types.CallbackQuery, match_state, state:
         await safe_sleep(2)
         
         if random.random() < 0.7:
-            # Увеличиваем счетчик пасов, а не голевых передач
+            # Увеличиваем счетчик пасов
             match_state['stats']['passes'] = match_state['stats'].get('passes', 0) + 1
             await send_photo_with_text(
                 callback.message,
@@ -1821,8 +1805,8 @@ async def handle_forward_pass(callback: types.CallbackQuery, match_state, state:
             )
             # Симулируем дальнейшую атаку команды
             await safe_sleep(2)
-            # Шанс на гол после успешной передачи
-            if random.random() < 0.45:  # 45% шанс гола
+            # 20% шанс гола после паса
+            if random.random() < 0.2:
                 # Увеличиваем счет команды и засчитываем голевую передачу
                 match_state['your_goals'] += 1
                 match_state['stats']['assists'] = match_state['stats'].get('assists', 0) + 1
@@ -1885,54 +1869,62 @@ async def handle_forward_dribble(callback: types.CallbackQuery, match_state, sta
             
         await send_photo_with_text(
             callback.message,
-            'dribble',
-            'start.jpg',
-            f"🏃 {match_state['current_team']} с мячом\n- Нападающий начинает дриблинг"
+            'attack',
+            'dribble_start.jpg',
+            f"⚽ {match_state['current_team']} с мячом\n- Нападающий начинает дриблинг"
         )
         await safe_sleep(2)
         
-        if random.random() < 0.6:
+        if random.random() < 0.6:  # 60% шанс успешного дриблинга
             await send_photo_with_text(
                 callback.message,
-                'dribble',
-                'success.jpg',
+                'attack',
+                'dribble_success.jpg',
                 "✅ Отличный дриблинг!\n- Нападающий обыграл защитника"
             )
-            # Симулируем дальнейшую атаку после успешного дриблинга
             await safe_sleep(2)
-            # Шанс на гол после успешного дриблинга
-            if random.random() < 0.35:  # 35% шанс гола
+            
+            # 20% шанс гола после дриблинга
+            if random.random() < 0.2:
                 match_state['your_goals'] += 1
                 match_state['stats']['goals'] = match_state['stats'].get('goals', 0) + 1
                 await send_photo_with_text(
                     callback.message,
                     'goals',
                     'goal.jpg',
-                    f"⚽ ГООООЛ!\n- Нападающий реализовал момент после дриблинга! Счёт: {match_state['your_goals']}-{match_state['opponent_goals']}"
+                    f"⚽ ГООООЛ!\n- Отличный дриблинг и удар! Счёт: {match_state['your_goals']}-{match_state['opponent_goals']}"
                 )
             else:
-                await send_photo_with_text(
-                    callback.message,
-                    'shot',
-                    'miss.jpg',
-                    "❌ Удар неточный\n- Не удалось завершить атаку после дриблинга"
-                )
-            # Сохраняем состояние перед продолжением
-            await state.update_data(match_state=match_state)
-            # Продолжаем матч
-            await continue_match(callback, match_state, state)
+                # 25% шанс гола после паса после дриблинга
+                if random.random() < 0.25:
+                    match_state['your_goals'] += 1
+                    match_state['stats']['assists'] = match_state['stats'].get('assists', 0) + 1
+                    await send_photo_with_text(
+                        callback.message,
+                        'goals',
+                        'goal.jpg',
+                        f"⚽ ГООООЛ!\n- Партнер реализовал момент после вашего дриблинга! Счёт: {match_state['your_goals']}-{match_state['opponent_goals']}"
+                    )
+                else:
+                    await send_photo_with_text(
+                        callback.message,
+                        'attack',
+                        'shot_miss.jpg',
+                        "❌ Удар неточный\n- Не удалось реализовать момент"
+                    )
         else:
             await send_photo_with_text(
                 callback.message,
-                'dribble',
-                'fail.jpg',
-                "❌ Потеря мяча\n- Защитник отобрал мяч"
+                'defense',
+                'tackle.jpg',
+                "❌ Дриблинг прерван\n- Защитник отобрал мяч"
             )
             await safe_sleep(1)
             await simulate_opponent_attack(callback, match_state)
-            # Сохраняем состояние перед продолжением
-            await state.update_data(match_state=match_state)
-            await continue_match(callback, match_state, state)
+        
+        # Сохраняем состояние перед продолжением
+        await state.update_data(match_state=match_state)
+        await continue_match(callback, match_state, state)
     except Exception as e:
         logger.error(f"Ошибка в handle_forward_dribble: {e}")
         # Продолжаем матч в случае ошибки
@@ -1946,51 +1938,62 @@ async def handle_forward_dribble(callback: types.CallbackQuery, match_state, sta
         await state.update_data(match_state=match_state)
 
 async def continue_match(callback: types.CallbackQuery, match_state, state: FSMContext):
-    # Увеличиваем минуту
-    match_state['minute'] += random.randint(8, 12)
-    
-    if match_state['minute'] < 90:
-        # Определяем, будет ли следующий момент атакой соперника для вратаря и защитника
-        position = match_state['position']
+    try:
+        # Увеличиваем минуту
+        old_minute = match_state['minute']
+        match_state['minute'] += random.randint(8, 12)
+        logger.info(f"Продолжение матча: {old_minute}' -> {match_state['minute']}'")
         
-        # Случайно выбираем, чья будет атака (40% шанс атаки своей команды)
-        is_team_attack = random.random() < 0.4
-        
-        if position in ["Вратарь", "Защитник"]:
-            if is_team_attack:
-                # Симулируем атаку своей команды
-                await simulate_team_attack(callback, match_state)
-                message = (
-                    f"⏱️ {match_state['minute']}' минута\n"
-                    f"Счёт: {match_state['your_goals']} - {match_state['opponent_goals']}\n"
-                    f"⚠️ {match_state['opponent_team']} начинает атаку!\n\n"
-                    "Выберите действие:"
-                )
+        if match_state['minute'] < 90:
+            # Определяем, будет ли следующий момент атакой соперника для вратаря и защитника
+            position = match_state['position']
+            
+            # Случайно выбираем, чья будет атака (40% шанс атаки своей команды)
+            is_team_attack = random.random() < 0.4
+            logger.debug(f"Тип атаки: {'команда' if is_team_attack else 'соперник'}")
+            
+            if position in ["Вратарь", "Защитник"]:
+                if is_team_attack:
+                    # Симулируем атаку своей команды
+                    logger.info(f"Атака команды {match_state['current_team']}")
+                    await simulate_team_attack(callback, match_state)
+                    message = (
+                        f"⏱️ {match_state['minute']}' минута\n"
+                        f"Счёт: {match_state['your_goals']} - {match_state['opponent_goals']}\n"
+                        f"⚠️ {match_state['opponent_team']} начинает атаку!\n\n"
+                        "Выберите действие:"
+                    )
+                else:
+                    match_state['is_opponent_attack'] = True
+                    logger.info(f"Атака соперника {match_state['opponent_team']}")
+                    message = (
+                        f"⏱️ {match_state['minute']}' минута\n"
+                        f"Счёт: {match_state['your_goals']} - {match_state['opponent_goals']}\n"
+                        f"⚠️ {match_state['opponent_team']} начинает атаку!\n\n"
+                        "Выберите действие:"
+                    )
             else:
-                match_state['is_opponent_attack'] = True
                 message = (
                     f"⏱️ {match_state['minute']}' минута\n"
                     f"Счёт: {match_state['your_goals']} - {match_state['opponent_goals']}\n"
-                    f"⚠️ {match_state['opponent_team']} начинает атаку!\n\n"
+                    f"- {'Последние минуты матча' if match_state['minute'] > 85 else 'Матч продолжается'}\n\n"
                     "Выберите действие:"
                 )
+            
+            # Создаем новую клавиатуру для следующего момента
+            keyboard = get_match_actions_keyboard(position)
+            
+            # Отправляем сообщение и сохраняем его ID
+            new_message = await callback.message.answer(message, reply_markup=keyboard)
+            match_state['last_message_id'] = new_message.message_id
+            await state.update_data(match_state=match_state)
+            logger.debug(f"Отправлено сообщение о продолжении матча (ID: {new_message.message_id})")
         else:
-            message = (
-                f"⏱️ {match_state['minute']}' минута\n"
-                f"Счёт: {match_state['your_goals']} - {match_state['opponent_goals']}\n"
-                f"- {'Последние минуты матча' if match_state['minute'] > 85 else 'Матч продолжается'}\n\n"
-                "Выберите действие:"
-            )
-        
-        # Создаем новую клавиатуру для следующего момента
-        keyboard = get_match_actions_keyboard(position)
-        
-        # Отправляем сообщение и сохраняем его ID
-        new_message = await callback.message.answer(message, reply_markup=keyboard)
-        match_state['last_message_id'] = new_message.message_id
-        await state.update_data(match_state=match_state)
-    else:
-        await finish_match(callback, state)
+            logger.info("Матч достиг 90 минут, завершаем")
+            await finish_match(callback, state)
+    except Exception as e:
+        logger.error(f"Ошибка при продолжении матча: {e}")
+        await callback.answer("Произошла ошибка. Попробуйте еще раз.")
 
 async def simulate_team_attack(callback: types.CallbackQuery, match_state):
     """Симуляция атаки своей команды"""
@@ -2090,390 +2093,168 @@ async def simulate_team_attack(callback: types.CallbackQuery, match_state):
 
 # Функция завершения матча
 async def finish_match(callback: types.CallbackQuery, state: FSMContext):
-    """
-    Завершает матч и показывает результаты
-    
-    Устанавливает флаг match_finished и очищает состояние,
-    чтобы предотвратить дальнейшие действия
-    """
-    data = await state.get_data()
-    match_state = data.get('match_state')
-    
-    if not match_state:
-        await callback.message.answer("Матч не найден.")
-        return
-    
-    # Отмечаем матч как завершенный
-    match_state['match_finished'] = True
-    await state.update_data(match_state=match_state)
-    
-    player = await get_player(callback.from_user.id)
-    if not player:
-        logger.error(f"Не удалось получить данные игрока {callback.from_user.id} при завершении матча")
-        await callback.message.answer("Произошла ошибка при сохранении статистики. Пожалуйста, обратитесь к администратору.")
-        return
-    
-    matches = player.matches + 1
-    wins = player.wins
-    draws = player.draws
-    losses = player.losses
-    current_round = player.current_round + 1
-    
-    if match_state['your_goals'] > match_state['opponent_goals']:
-        wins += 1
-        result = "победили"
-        result_emoji = "🏆"
-    elif match_state['your_goals'] < match_state['opponent_goals']:
-        losses += 1
-        result = "проиграли"
-        result_emoji = "😔"
-    else:
-        draws += 1
-        result = "сыграли вничью"
-        result_emoji = "🤝"
-
-    logger.info(
-        f"Матч завершен: {player.club} {result} {match_state['opponent_team']} "
-        f"({match_state['your_goals']}-{match_state['opponent_goals']})"
-    )
-
-    # Получаем новую дату после матча
-    new_date = await advance_virtual_date(player)
-    
-    # Создаем статистику матча для обновления
-    match_stats = {
-        "matches": matches,
-        "wins": wins,
-        "draws": draws,
-        "losses": losses,
-        "current_round": current_round,
-        "last_match_date": new_date
-    }
-    
-    # Ограничиваем максимальную статистику за один матч
-    MAX_STATS_PER_MATCH = 10  # Максимум голов, передач и т.д. за один матч
-    
-    # Добавляем статистику игрока для текущего матча
-    if match_state['stats'].get('goals', 0) > 0:
-        goals = min(match_state['stats']['goals'], MAX_STATS_PER_MATCH)
-        match_stats["goals"] = player.goals + goals
-    
-    if match_state['stats'].get('assists', 0) > 0:
-        assists = min(match_state['stats']['assists'], MAX_STATS_PER_MATCH)
-        match_stats["assists"] = player.assists + assists
-    
-    if match_state['stats'].get('saves', 0) > 0:
-        saves = min(match_state['stats']['saves'], MAX_STATS_PER_MATCH)
-        match_stats["saves"] = player.saves + saves
-    
-    if match_state['stats'].get('tackles', 0) > 0:
-        tackles = min(match_state['stats']['tackles'], MAX_STATS_PER_MATCH)
-        match_stats["tackles"] = player.tackles + tackles
-    
-    # Обновляем статистику в базе данных
-    update_success = await update_player_stats(
-        user_id=callback.from_user.id,
-        **match_stats
-    )
-    
-    if not update_success:
-        logger.error(f"Не удалось обновить статистику игрока {callback.from_user.id} при завершении матча")
-        await callback.message.answer("Произошла ошибка при сохранении статистики. Статистика может отображаться некорректно.")
-    
-    # Форматируем дату для отображения с учетом возможных форматов даты
     try:
-        # Проверяем формат даты и преобразуем соответственно
-        if "-" in new_date:  # Формат YYYY-MM-DD
-            formatted_date = datetime.strptime(new_date, "%Y-%m-%d").strftime("%d.%m.%Y")
-        else:  # Формат DD.MM.YYYY
-            formatted_date = new_date  # Дата уже в нужном формате
-    except Exception as e:
-        logger.error(f"Ошибка при форматировании даты '{new_date}': {e}")
-        formatted_date = new_date  # В случае ошибки используем как есть
-    
-    stats = (f"{result_emoji} Матч завершен! Вы {result}!\n"
-            f"🏆 Тур {match_state['current_round']} ФНЛ Серебро\n"
-            f"📅 {formatted_date}\n\n"
-            f"Итоговый счет: {match_state['your_goals']}-{match_state['opponent_goals']}\n\n"
-            f"📊 Ваша статистика в матче:\n"
-            f"Голы: {min(match_state['stats'].get('goals', 0), MAX_STATS_PER_MATCH)}\n"
-            f"Голевые передачи: {min(match_state['stats'].get('assists', 0), MAX_STATS_PER_MATCH)}\n"
-            f"Сейвы: {min(match_state['stats'].get('saves', 0), MAX_STATS_PER_MATCH)}\n"
-            f"Отборы: {min(match_state['stats'].get('tackles', 0), MAX_STATS_PER_MATCH)}\n\n"
-            f"📊 Общая статистика:\n"
-            f"Матчи: {matches}\n"
-            f"Победы: {wins}\n"
-            f"Ничьи: {draws}\n"
-            f"Поражения: {losses}")
-    
-    # Проверяем возможность перехода
-    player = await get_player(callback.from_user.id)
-    league, offers = get_transfer_offers(player)
-    if offers:
-        logger.info(f"Игроку {player.name} (ID: {callback.from_user.id}) поступили предложения о переходе")
-        await callback.message.answer(
-            "Вам поступили предложения от других клубов! Хотите перейти?",
-            reply_markup=get_transfer_keyboard(offers, league)
+        data = await state.get_data()
+        match_state = data.get('match_state', {})
+        
+        if not match_state:
+            await callback.answer("Ошибка: состояние матча не найдено")
+            return
+            
+        player = await get_player(callback.from_user.id)
+        if not player:
+            await callback.answer("Ошибка: игрок не найден")
+            return
+            
+        # Обновляем статистику
+        result = match_state.get('result', 'draw')
+        if result == 'win':
+            await update_player_stats(player.user_id, wins=player.wins + 1)
+            logger.info(f"Игрок {player.name} выиграл матч против {match_state.get('opponent_team')}")
+        elif result == 'loss':
+            await update_player_stats(player.user_id, losses=player.losses + 1)
+            logger.info(f"Игрок {player.name} проиграл матч против {match_state.get('opponent_team')}")
+        else:
+            await update_player_stats(player.user_id, draws=player.draws + 1)
+            logger.info(f"Игрок {player.name} сыграл вничью с {match_state.get('opponent_team')}")
+            
+        # Обновляем общее количество матчей и текущий тур
+        await update_player_stats(
+            player.user_id, 
+            matches=player.matches + 1,
+            current_round=player.current_round + 1
         )
-        try:
-            await callback.answer()
-        except Exception as e:
-            logger.debug(f"Не удалось ответить на callback: {e}")
-        return
-
-    keyboard = InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(text="📊 Статистика", callback_data="show_stats")],
-        [InlineKeyboardButton(text="🏠 Вернуться в меню", callback_data="return_to_menu")]
-    ])
-    
-    # Очищаем состояние перед завершением
-    await state.clear()
-    await state.set_state(GameStates.playing)
-    
-    await callback.message.answer(stats, reply_markup=keyboard)
-    try:
-        await callback.answer()
+        
+        # Обновляем виртуальную дату
+        new_date = await advance_virtual_date(player)
+        logger.info(f"Обновлена дата для игрока {player.name}: {new_date}")
+        
+        # Очищаем все состояния
+        await state.clear()
+        
+        # Отправляем сообщение о завершении матча
+        await callback.message.edit_text(
+            f"Матч завершен!\n"
+            f"Результат: {result.upper()}\n"
+            f"Счет: {match_state.get('score', '0-0')}\n\n"
+            f"Ваша статистика:\n"
+            f"Матчи: {player.matches + 1}\n"
+            f"Победы: {player.wins + (1 if result == 'win' else 0)}\n"
+            f"Ничьи: {player.draws + (1 if result == 'draw' else 0)}\n"
+            f"Поражения: {player.losses + (1 if result == 'loss' else 0)}\n\n"
+            f"Следующий матч: {new_date}",
+            reply_markup=get_main_keyboard()
+        )
     except Exception as e:
-        logger.debug(f"Не удалось ответить на callback: {e}")
+        logger.error(f"Ошибка при завершении матча: {e}")
+        await callback.answer("Произошла ошибка при завершении матча")
+        # В случае ошибки тоже очищаем состояние
+        await state.clear()
 
 @dp.callback_query(lambda c: c.data == "show_stats")
 async def show_stats_callback(callback: types.CallbackQuery, state: FSMContext):
-    # Очищаем состояние матча
-    await state.set_data({})
-    await state.set_state(GameStates.playing)
-    
-    if not await check_subscription(callback.from_user.id):
-        await callback.message.answer(
-            "Для просмотра статистики необходимо подписаться на наш канал!",
-            reply_markup=get_subscription_keyboard()
-        )
+    # Проверяем, не идет ли сейчас матч
+    current_state = await state.get_state()
+    if current_state == GameStates.playing.state:
+        await callback.answer("Нельзя просматривать статистику во время матча!", show_alert=True)
         return
-    
+        
+    # Очищаем состояние матча
+    await state.update_data(match_state=None)
+    # Получаем данные игрока
     player = await get_player(callback.from_user.id)
     if not player:
-        await callback.message.answer(
-            "Статистика не найдена. Начните игру с команды /start"
-        )
+        await callback.message.answer("Вы еще не создали игрока. Используйте /start для начала игры.")
         return
     
-    # Получаем статистику с значениями по умолчанию, если какие-то данные отсутствуют
-    name = player.name if player.name else "Игрок"
-    position = player.position if player.position else "Не выбрана"
-    club = player.club if player.club else "Не выбран"
-    matches = player.matches if player.matches > 0 else 0
-    wins = player.wins if player.wins > 0 else 0
-    draws = player.draws if player.draws > 0 else 0
-    losses = player.losses if player.losses > 0 else 0
-
-    position_stats = ""
-    if position == "Вратарь":
-        saves = player.saves if player.saves > 0 else 0
-        position_stats = f"Сейвы: {saves}\n"
-    elif position == "Защитник":
-        goals = player.goals if player.goals > 0 else 0
-        assists = player.assists if player.assists > 0 else 0
-        tackles = player.tackles if player.tackles > 0 else 0
-        position_stats = f"Голы: {goals}\nГолевые передачи: {assists}\nОтборы: {tackles}\n"
-    elif position == "Нападающий":
-        goals = player.goals if player.goals > 0 else 0
-        assists = player.assists if player.assists > 0 else 0
-        position_stats = f"Голы: {goals}\nГолевые передачи: {assists}\n"
+    # Формируем сообщение со статистикой
+    stats_message = (
+        f"📊 Статистика игрока {player.name}\n\n"
+        f"🏃 Позиция: {player.position}\n"
+        f"🏟️ Клуб: {player.club}\n"
+        f"🎮 Матчей сыграно: {player.matches}\n"
+        f"✅ Побед: {player.wins}\n"
+        f"🤝 Ничьих: {player.draws}\n"
+        f"❌ Поражений: {player.losses}\n"
+        f"⚽ Голов: {player.goals}\n"
+        f"🎯 Голевых передач: {player.assists}\n"
+        f"🖐️ Сейвов: {player.saves}\n"
+        f"🛡️ Отборов: {player.tackles}\n"
+    )
     
-    stats = (f"📊 Статистика игрока {name} ({position})\n"
-            f"Клуб: {club}\n\n"
-            f"Матчи: {matches}\n"
-            f"Победы: {wins}\n"
-            f"Ничьи: {draws}\n"
-            f"Поражения: {losses}\n\n"
-            f"{position_stats}")
-    
-    await callback.message.answer(stats)
-    try:
-        await callback.answer()
-    except Exception as e:
-        logger.debug(f"Не удалось ответить на callback: {e}")
+    await callback.message.answer(stats_message, reply_markup=get_main_menu_keyboard())
 
 @dp.callback_query(lambda c: c.data == "return_to_menu")
-async def return_to_menu_callback(callback: types.CallbackQuery, state: FSMContext):
-    # Очищаем состояние матча
-    await state.clear()
-    await state.set_state(GameStates.playing)
-    
-    player = await get_player(callback.from_user.id)
-    if player:
-        welcome_text = (
-            f"👋 Привет, {player.name}!\n\n"
-            f"Вы играете за {player.club}\n"
-            f"Позиция: {player.position}\n"
-            f"{'✅ В стартовом составе' if player.is_in_squad else '❌ Не в заявке'}\n\n"
-            "Добро пожаловать в футбольный симулятор!\n"
-            "🏆 Побеждай в матчах\n"
-            "⭐ Стань легендой футбола!"
-        )
-        with open("mbappe.png", "rb") as file:
-            photo = BufferedInputFile(file.read(), filename="mbappe.png")
-            await callback.message.answer_photo(
-                photo,
-                caption=welcome_text,
-                reply_markup=get_main_keyboard()
-            )
+async def handle_return_to_menu(callback: types.CallbackQuery, state: FSMContext):
     try:
-        await callback.answer()
-    except Exception as e:
-        logger.debug(f"Не удалось ответить на callback: {e}")
-
-async def simulate_opponent_attack(callback: types.CallbackQuery, match_state):
-    attack_type = random.choices(
-        ['dribble', 'shot', 'pass'],
-        weights=[0.3, 0.4, 0.3]
-    )[0]
-    
-    # Проверяем наличие необходимых полей в match_state
-    if 'stats' not in match_state:
-        match_state['stats'] = {
-            "goals": 0,
-            "assists": 0,
-            "saves": 0,
-            "tackles": 0,
-            "fouls": 0,
-            "passes": 0,
-            "interceptions": 0,
-            "clearances": 0,
-            "throws": 0
-        }
-    
-    if attack_type == "dribble":
-        await send_photo_with_text(
-            callback.message,
-            'opponent',
-            'dribble_start.jpg',
-            f"⚽ {match_state['opponent_team']} с мячом\n- Игрок соперника начинает дриблинг"
-        )
-        await asyncio.sleep(3)
-        
-        if random.random() < 0.6:
-            await send_photo_with_text(
-                callback.message,
-                'opponent',
-                'dribble_success.jpg',
-                "❌ Соперник обыграл защитника\n- Игрок соперника успешно прошел защиту"
+        player = await get_player(callback.from_user.id)
+        if player:
+            welcome_text = (
+                f"👋 Привет, {player.name}!\n\n"
+                f"Вы играете за {player.club}\n"
+                f"Позиция: {player.position}\n"
+                f"{'✅ В стартовом составе' if player.is_in_squad else '❌ Не в заявке'}\n\n"
+                "Добро пожаловать в футбольный симулятор!\n"
+                "🏆 Побеждай в матчах\n"
+                "⭐ Стань легендой футбола!"
             )
-            await asyncio.sleep(3)
-            
-            if random.random() < 0.5:
-                await send_photo_with_text(
-                    callback.message,
-                    'opponent',
-                    'shot_start.jpg',
-                    "⚡ Подготовка к удару\n- Игрок соперника готовится нанести удар"
-                )
-                await asyncio.sleep(3)
-                
-                if random.random() < 0.4:
-                    match_state['opponent_goals'] += 1
-                    await send_photo_with_text(
-                        callback.message,
-                        'opponent',
-                        'goal.jpg',
-                        f"⚽ ГООООЛ соперника!\n- Отличный удар! Счёт: {match_state['your_goals']}-{match_state['opponent_goals']}"
-                    )
-                else:
-                    match_state['stats']['saves'] = match_state['stats'].get('saves', 0) + 1
-                    await send_photo_with_text(
-                        callback.message,
-                        'defense',
-                        'save.jpg',
-                        "✅ Наш вратарь отразил удар\n- Вратарь совершил отличный сейв"
-                    )
-            else:
-                match_state['stats']['tackles'] = match_state['stats'].get('tackles', 0) + 1
-                await send_photo_with_text(
-                    callback.message,
-                    'defense',
-                    'tackle.jpg',
-                    "✅ Наш защитник успел подстраховать\n- Защитник не дал сопернику ударить"
+            await callback.message.delete()
+            with open("mbappe.png", "rb") as file:
+                photo = BufferedInputFile(file.read(), filename="mbappe.png")
+                await callback.message.answer_photo(
+                    photo,
+                    caption=welcome_text,
+                    reply_markup=get_main_keyboard()
                 )
         else:
-            match_state['stats']['tackles'] = match_state['stats'].get('tackles', 0) + 1
-            await send_photo_with_text(
-                callback.message,
-                'defense',
-                'tackle.jpg',
-                "✅ Наш защитник отобрал мяч\n- Защитник успешно отобрал мяч"
+            await callback.message.delete()
+            await callback.message.answer(
+                "👋 Добро пожаловать в футбольный симулятор!\n\n"
+                "Для начала игры нужно создать своего игрока.\n"
+                "Введите имя вашего игрока:"
             )
-    
-    elif attack_type == "shot":
+            await state.set_state(GameStates.waiting_name)
+    except TelegramBadRequest as e:
+        if "message is not modified" in str(e):
+            pass
+        else:
+            raise
+    await callback.answer()
+
+async def simulate_opponent_attack(callback: types.CallbackQuery, match_state):
+    try:
         await send_photo_with_text(
             callback.message,
-            'opponent',
-            'shot_start.jpg',
-            f"⚽ {match_state['opponent_team']} с мячом\n- Игрок соперника готовится к удару"
+            'attack',
+            'opponent_attack.jpg',
+            f"⚽ {match_state['opponent_team']} с мячом\n- Соперник атакует"
         )
-        await asyncio.sleep(3)
+        await safe_sleep(2)
         
-        if random.random() < 0.3:
+        # Уменьшаем шанс на гол до 25%
+        if random.random() < 0.25:  # 25% шанс гола
             match_state['opponent_goals'] += 1
             await send_photo_with_text(
                 callback.message,
-                'opponent',
+                'goals',
                 'goal.jpg',
-                f"⚽ ГООООЛ соперника!\n- Отличный удар! Счёт: {match_state['your_goals']}-{match_state['opponent_goals']}"
+                f"⚽ ГООООЛ!\n- Соперник забил! Счёт: {match_state['your_goals']}-{match_state['opponent_goals']}"
             )
         else:
-            match_state['stats']['saves'] = match_state['stats'].get('saves', 0) + 1
             await send_photo_with_text(
                 callback.message,
                 'defense',
-                'save.jpg',
-                "✅ Наш вратарь отразил удар\n- Вратарь совершил отличный сейв"
+                'defense_success.jpg',
+                "✅ Оборона справилась!\n- Атака соперника отбита"
             )
-    
-    elif attack_type == "pass":
-        await send_photo_with_text(
-            callback.message,
-            'opponent',
-            'pass_start.jpg',
-            f"⚽ {match_state['opponent_team']} с мячом\n- Игрок соперника ищет партнера"
-        )
-        await asyncio.sleep(3)
-        
-        if random.random() < 0.6:
-            await send_photo_with_text(
-                callback.message,
-                'opponent',
-                'pass_success.jpg',
-                "❌ Соперник отдал опасный пас\n- Партнер получил мяч в выгодной позиции"
-            )
-            await asyncio.sleep(3)
-            
-            if random.random() < 0.4:
-                match_state['opponent_goals'] += 1
-                await send_photo_with_text(
-                    callback.message,
-                    'opponent',
-                    'goal.jpg',
-                    f"⚽ ГООООЛ соперника!\n- Партнер реализовал момент! Счёт: {match_state['your_goals']}-{match_state['opponent_goals']}"
-                )
-            else:
-                match_state['stats']['saves'] = match_state['stats'].get('saves', 0) + 1
-                await send_photo_with_text(
-                    callback.message,
-                    'defense',
-                    'save.jpg',
-                    "✅ Наш вратарь отразил удар\n- Вратарь совершил отличный сейв"
-                )
-        else:
-            match_state['stats']['tackles'] = match_state['stats'].get('tackles', 0) + 1
-            await send_photo_with_text(
-                callback.message,
-                'defense',
-                'intercept.jpg',
-                "✅ Наш защитник перехватил пас\n- Защитник успешно перехватил передачу"
-            )
+    except Exception as e:
+        logger.error(f"Ошибка в simulate_opponent_attack: {e}")
+        # В случае ошибки просто продолжаем игру
+        pass
 
 async def reset_player_stats(user_id):
     try:
-        async with AsyncSessionLocal() as session:
+        async with async_session() as session:
             await session.execute(
                 update(Player).where(Player.user_id == user_id).values(
                     matches=0,
@@ -2496,7 +2277,7 @@ async def reset_player_stats(user_id):
 
 async def delete_player(user_id):
     try:
-        async with AsyncSessionLocal() as session:
+        async with async_session() as session:
             await session.execute(
                 delete(Player).where(Player.user_id == user_id)
             )
@@ -2708,55 +2489,116 @@ async def cmd_admin_delete_player(message: types.Message, state: FSMContext):
 
 @dp.message(Command("play"))
 async def cmd_play(message: types.Message, state: FSMContext):
-    """Обработчик команды /play - перенаправляет на запуск матча через кнопку"""
-    logger.info(f"Пользователь {message.from_user.id} использовал команду /play")
-    
+    # Проверяем, не идет ли уже матч
+    current_state = await state.get_state()
+    if current_state == GameStates.playing.state:
+        await message.answer("У вас уже идет матч!")
+        return
+        
+    # Получаем данные игрока
     player = await get_player(message.from_user.id)
     if not player:
-        logger.warning(f"Пользователь {message.from_user.id} попытался начать матч без создания игрока")
-        await message.answer(
-            "Сначала создайте своего игрока с помощью команды /start"
-        )
+        await message.answer("Вы еще не создали игрока. Используйте /start для начала игры.")
         return
     
-    await message.answer(
-        "Для запуска матча используйте кнопку 'Играть матч' в главном меню:",
-        reply_markup=get_main_keyboard()
-    )
+    # Проверяем, может ли игрок играть матч
+    can_play, message_text = await can_play_match(player)
+    if not can_play:
+        await message.answer(message_text)
+        return
+    
+    # Устанавливаем состояние playing
+    await state.set_state(GameStates.playing)
+    
+    # Инициализируем состояние матча
+    match_state = {
+        'minute': 0,
+        'your_goals': 0,
+        'opponent_goals': 0,
+        'position': player.position,
+        'current_team': player.club,
+        'opponent_team': await get_opponent_by_round(player, player.current_round),
+        'is_processing': False,
+        'stats': {
+            "goals": 0,
+            "assists": 0,
+            "saves": 0,
+            "tackles": 0,
+            "fouls": 0,
+            "passes": 0,
+            "interceptions": 0,
+            "clearances": 0,
+            "throws": 0
+        }
+    }
+    
+    await state.update_data(match_state=match_state)
+    
+    # Начинаем матч
+    await start_match(message, match_state, state)
 
 @dp.message(Command("stats"))
 async def cmd_stats(message: types.Message, state: FSMContext):
-    """Обработчик команды /stats - перенаправляет на просмотр статистики через кнопку"""
-    logger.info(f"Пользователь {message.from_user.id} использовал команду /stats")
-    
+    # Проверяем, не идет ли сейчас матч
+    current_state = await state.get_state()
+    if current_state == GameStates.playing.state:
+        await message.answer("Нельзя просматривать статистику во время матча!")
+        return
+        
+    # Получаем данные игрока
     player = await get_player(message.from_user.id)
     if not player:
-        logger.warning(f"Пользователь {message.from_user.id} попытался просмотреть статистику без создания игрока")
-        await message.answer(
-            "Сначала создайте своего игрока с помощью команды /start"
-        )
+        await message.answer("Вы еще не создали игрока. Используйте /start для начала игры.")
         return
     
-    # Передаем управление обработчику кнопки "Статистика"
-    callback_query = types.CallbackQuery(
-        id="stats_command",
-        from_user=message.from_user,
-        chat_instance="stats_command_instance",
-        message=message,
-        data="show_stats"
+    # Формируем сообщение со статистикой
+    stats_message = (
+        f"📊 Статистика игрока {player.name}\n\n"
+        f"🏃 Позиция: {player.position}\n"
+        f"🏟️ Клуб: {player.club}\n"
+        f"🎮 Матчей сыграно: {player.matches}\n"
+        f"✅ Побед: {player.wins}\n"
+        f"🤝 Ничьих: {player.draws}\n"
+        f"❌ Поражений: {player.losses}\n"
+        f"⚽ Голов: {player.goals}\n"
+        f"🎯 Голевых передач: {player.assists}\n"
+        f"🖐️ Сейвов: {player.saves}\n"
+        f"🛡️ Отборов: {player.tackles}\n"
     )
     
-    await show_stats_callback(callback_query, state)
+    await message.answer(stats_message, reply_markup=get_main_menu_keyboard())
+
+@dp.message(Command("calendar"))
+async def cmd_calendar(message: types.Message, state: FSMContext):
+    # Проверяем, не идет ли сейчас матч
+    current_state = await state.get_state()
+    if current_state == GameStates.playing.state:
+        await message.answer("Нельзя просматривать календарь во время матча!")
+        return
+        
+    # Получаем данные игрока
+    player = await get_player(message.from_user.id)
+    if not player:
+        await message.answer("Вы еще не создали игрока. Используйте /start для начала игры.")
+        return
+    
+    # Получаем следующие матчи
+    upcoming_matches = await get_player_next_matches(player, count=5)
+    
+    # Генерируем визуализацию календаря
+    calendar_text = await generate_calendar_visualization(player, upcoming_matches)
+    
+    await message.answer(calendar_text, reply_markup=get_main_menu_keyboard())
 
 async def main():
+    # Создаем таблицы, если их нет
+    await init_db()
+    
+    # Запускаем бота
     try:
-        logger.info("Запуск бота...")
-        await init_db()
-        logger.info("База данных инициализирована, начинаем поллинг...")
         await dp.start_polling(bot)
-    except Exception as e:
-        logger.critical(f"Критическая ошибка при запуске бота: {e}")
-        raise
+    finally:
+        await bot.session.close()
 
 # Функция для создания персонального календаря игрока
 def create_player_calendar(club_name):
@@ -2844,90 +2686,25 @@ async def generate_calendar_visualization(player, upcoming_matches):
 
 @dp.callback_query(lambda c: c.data == "show_calendar")
 async def show_calendar_callback(callback: types.CallbackQuery, state: FSMContext):
-    """Обработчик кнопки 'Календарь', показывает ближайшие матчи игрока"""
-    # Очищаем состояние матча
-    await state.set_data({})
-    await state.set_state(GameStates.playing)
-    
-    if not await check_subscription(callback.from_user.id):
-        await callback.message.answer(
-            "Для просмотра календаря необходимо подписаться на наш канал!",
-            reply_markup=get_subscription_keyboard()
-        )
+    # Проверяем, не идет ли сейчас матч
+    current_state = await state.get_state()
+    if current_state == GameStates.playing.state:
+        await callback.answer("Нельзя просматривать календарь во время матча!", show_alert=True)
         return
-    
+        
+    # Получаем данные игрока
     player = await get_player(callback.from_user.id)
     if not player:
-        await callback.message.answer(
-            "Календарь не найден. Начните игру с команды /start"
-        )
+        await callback.message.answer("Вы еще не создали игрока. Используйте /start для начала игры.")
         return
     
-    # Получаем ближайшие 10 матчей (или меньше, если в календаре меньше)
-    upcoming_matches = await get_player_next_matches(player, 10)
+    # Получаем следующие матчи
+    upcoming_matches = await get_player_next_matches(player, count=5)
     
-    if not upcoming_matches:
-        await callback.message.answer(
-            "📅 Календарь матчей\n\n"
-            "❌ Не удалось загрузить календарь или у вас нет запланированных матчей.\n"
-            "Попробуйте позже или обратитесь к администратору."
-        )
-        return
-    
-    # Генерируем визуальное представление календаря
+    # Генерируем визуализацию календаря
     calendar_text = await generate_calendar_visualization(player, upcoming_matches)
     
-    # Добавляем кнопку для возврата в меню
-    keyboard = InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(text="🏠 Вернуться в меню", callback_data="return_to_menu")]
-    ])
-    
-    await callback.message.answer(calendar_text, reply_markup=keyboard)
-    try:
-        await callback.answer()
-    except Exception as e:
-        logger.debug(f"Не удалось ответить на callback: {e}")
-
-@dp.message(Command("calendar"))
-async def cmd_calendar(message: types.Message, state: FSMContext):
-    """Обработчик команды /calendar для просмотра календаря матчей"""
-    logger.info(f"Пользователь {message.from_user.id} запросил календарь матчей")
-    
-    # Проверяем, не идет ли сейчас матч
-    data = await state.get_data()
-    if data.get('match_state'):
-        logger.warning(f"Пользователь {message.from_user.id} попытался просмотреть календарь во время матча")
-        await message.answer(
-            "❌ Сейчас идет матч! Дождитесь его завершения."
-        )
-        return
-    
-    if not await check_subscription(message.from_user.id):
-        logger.warning(f"Пользователь {message.from_user.id} не подписан на канал при попытке просмотреть календарь")
-        await message.answer(
-            "Для просмотра календаря необходимо подписаться на наш канал!",
-            reply_markup=get_subscription_keyboard()
-        )
-        return
-    
-    player = await get_player(message.from_user.id)
-    if not player:
-        logger.warning(f"Пользователь {message.from_user.id} попытался просмотреть календарь без создания игрока")
-        await message.answer(
-            "Сначала создайте своего игрока с помощью команды /start"
-        )
-        return
-    
-    # Создаем фейковый callback query для вызова обработчика календаря
-    callback_query = types.CallbackQuery(
-        id="calendar_command",
-        from_user=message.from_user,
-        chat_instance="calendar_command_instance",
-        message=message,
-        data="show_calendar"
-    )
-    
-    await show_calendar_callback(callback_query, state)
+    await callback.message.answer(calendar_text, reply_markup=get_main_menu_keyboard())
 
 async def get_player_next_matches(player, count=5):
     """Получает ближайшие матчи из персонального календаря игрока"""
@@ -2964,27 +2741,34 @@ async def get_player_next_matches(player, count=5):
 
 # Функция создания календаря для нового сезона
 async def start_new_season(player):
-    """
-    Создаёт новый календарь для игрока на новый сезон
-    и обновляет данные игрока в базе данных
-    """
+    """Начинает новый сезон для игрока"""
     try:
-        logger.info(f"Создание нового сезона для игрока {player.name} (ID: {player.user_id})")
-        
-        # Создаем новый календарь для клуба игрока
-        new_calendar = create_player_calendar(player.club)
-        
-        # Обновляем данные игрока в базе
-        await update_player_stats(
-            user_id=player.user_id,
-            personal_calendar=new_calendar,
-            current_round=1  # Сбрасываем текущий тур на 1
-        )
-        
-        logger.info(f"Новый сезон начат для игрока {player.name} (ID: {player.user_id})")
-        return True
+        if not player:
+            logger.error("Передан пустой объект игрока")
+            return False
+            
+        # Создаем новый календарь
+        calendar_json = create_player_calendar(player.club)
+        if not calendar_json:
+            logger.error(f"Не удалось создать календарь для клуба {player.club}")
+            return False
+            
+        # Обновляем данные игрока
+        try:
+            await update_player_stats(
+                user_id=player.user_id,
+                current_round=1,
+                last_match_date=SEASON_START_DATE,
+                personal_calendar=calendar_json
+            )
+            logger.info(f"Новый сезон успешно начат для игрока {player.name}")
+            return True
+        except Exception as e:
+            logger.error(f"Ошибка при обновлении данных игрока {player.name}: {e}")
+            return False
+            
     except Exception as e:
-        logger.error(f"Ошибка при создании нового сезона для игрока {player.name} (ID: {player.user_id}): {e}")
+        logger.error(f"Критическая ошибка при начале нового сезона: {e}")
         return False
 
 # Функция для полного сброса базы данных
@@ -3084,14 +2868,29 @@ async def start_match(message, match_state, state: FSMContext):
     """Запускает игровой процесс, отображает первое игровое сообщение"""
     try:
         # Получаем информацию о матче
-        current_team = match_state['current_team']
-        opponent_team = match_state['opponent_team']
-        current_round = match_state['current_round']
-        position = match_state['position']
+        current_team = match_state.get('current_team')
+        opponent_team = match_state.get('opponent_team')
+        current_round = match_state.get('current_round')
+        position = match_state.get('position')
         is_home = match_state.get('is_home', True)
         
+        if not all([current_team, opponent_team, current_round, position]):
+            logger.error(f"Отсутствуют необходимые данные в match_state: {match_state}")
+            await message.answer("Ошибка: неверные данные матча")
+            return
+        
         # Получаем виртуальную дату
-        virtual_date = match_state.get('virtual_date', datetime.now().strftime("%d.%m.%Y"))
+        player = await get_player(message.from_user.id)
+        if not player:
+            logger.error(f"Игрок не найден для пользователя {message.from_user.id}")
+            await message.answer("Ошибка: игрок не найден")
+            return
+            
+        virtual_date = player.last_match_date
+        if not virtual_date:
+            logger.error(f"Отсутствует дата последнего матча для игрока {player.name}")
+            await message.answer("Ошибка: неверная дата матча")
+            return
         
         # Начинаем с нулевой минуты
         match_state['minute'] = 0
@@ -3101,6 +2900,7 @@ async def start_match(message, match_state, state: FSMContext):
         match_state['opponent_goals'] = 0
         match_state['is_processing'] = False
         match_state['actions_count'] = 0  # Счетчик действий игрока
+        match_state['virtual_date'] = virtual_date  # Сохраняем дату в состоянии матча
         
         # Инициализируем статистику всеми полями, чтобы избежать KeyError
         match_state['stats'] = {
@@ -3143,25 +2943,25 @@ async def start_match(message, match_state, state: FSMContext):
         else:
             match_text += f"⚽ {current_team} владеет мячом.\nВыберите действие:"
         
-        # Отправляем сообщение с кнопками
-        new_message = await message.answer(
-            match_text,
-            parse_mode="HTML",
-            reply_markup=get_match_actions_keyboard(position)
-        )
-        
-        # Обновляем ID последнего сообщения
-        match_state['last_message_id'] = new_message.message_id
-        await state.update_data(match_state=match_state)
-        
-        logger.info(f"Матч успешно начат: {current_team} vs {opponent_team} (Тур {current_round})")
-        
+        try:
+            # Отправляем сообщение с кнопками
+            new_message = await message.answer(
+                match_text,
+                parse_mode="HTML",
+                reply_markup=get_match_actions_keyboard(position)
+            )
+            match_state['last_message_id'] = new_message.message_id
+            await state.update_data(match_state=match_state)
+            logger.info(f"Матч успешно начат для игрока {player.name} (ID: {message.from_user.id})")
+        except Exception as e:
+            logger.error(f"Ошибка при отправке сообщения о начале матча: {e}")
+            await message.answer("Ошибка при начале матча. Пожалуйста, попробуйте снова.")
+            await state.clear()
+            
     except Exception as e:
-        logger.error(f"Ошибка при запуске матча: {e}")
-        await message.answer(
-            "Произошла ошибка при запуске матча. Пожалуйста, попробуйте снова.",
-            reply_markup=get_main_keyboard()
-        )
+        logger.error(f"Критическая ошибка в start_match: {e}")
+        await message.answer("Произошла ошибка при начале матча. Пожалуйста, попробуйте снова.")
+        await state.clear()
 
 @dp.callback_query(lambda c: c.data.startswith('continue_match_'))
 async def handle_continue_match(callback: types.CallbackQuery, state: FSMContext):
@@ -3222,6 +3022,463 @@ async def handle_continue_match(callback: types.CallbackQuery, state: FSMContext
     finally:
         match_state['is_processing'] = False
         await state.update_data(match_state=match_state)
+
+# Функция для проверки прав администратора
+def is_admin(user_id: int) -> bool:
+    return user_id == 5259325234  # Ваш ID
+
+# Клавиатура админ-панели
+def get_admin_keyboard():
+    return InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="📅 Изменить дату", callback_data="admin_change_date")],
+        [InlineKeyboardButton(text="🔄 Изменить тур", callback_data="admin_change_round")],
+        [InlineKeyboardButton(text="⚽ Изменить голы", callback_data="admin_change_goals")],
+        [InlineKeyboardButton(text="🎯 Изменить передачи", callback_data="admin_change_assists")],
+        [InlineKeyboardButton(text="🖐️ Изменить сейвы", callback_data="admin_change_saves")],
+        [InlineKeyboardButton(text="🛡️ Изменить отборы", callback_data="admin_change_tackles")],
+        [InlineKeyboardButton(text="🔍 Выбрать игрока", callback_data="admin_select_player")],
+        [InlineKeyboardButton(text="⬅️ Назад", callback_data="return_to_menu")]
+    ])
+
+@dp.message(Command("admin_panel"))
+async def cmd_admin_panel(message: types.Message):
+    if not is_admin(message.from_user.id):
+        await message.answer("❌ У вас нет прав для доступа к админ-панели.")
+        return
+    
+    await message.answer(
+        "🔧 Админ-панель\n\n"
+        "Выберите действие:",
+        reply_markup=get_admin_keyboard()
+    )
+
+@dp.callback_query(lambda c: c.data.startswith('admin_'))
+async def handle_admin_callback(callback: types.CallbackQuery, state: FSMContext):
+    if not is_admin(callback.from_user.id):
+        await callback.answer("❌ У вас нет прав для доступа к админ-панели.", show_alert=True)
+        return
+    
+    action = callback.data.split('_')[1]
+    
+    if action == "back":
+        await callback.message.delete()
+        return
+    
+    if action == "select_player":
+        await callback.message.answer(
+            "Введите ID игрока:"
+        )
+        await state.set_state(GameStates.admin_waiting_player_id)
+        await callback.answer()  # Отвечаем на callback, чтобы убрать часики
+        return
+    
+    # Получаем текущий выбранный ID игрока из базы данных
+    admin = await get_player(callback.from_user.id)
+    player_id = admin.admin_selected_player_id if admin else None
+    
+    if not player_id:
+        await callback.message.answer(
+            "Сначала выберите игрока!",
+            reply_markup=get_admin_keyboard()
+        )
+        await callback.answer()  # Отвечаем на callback
+        return
+    
+    if action == "change_date":
+        await callback.message.answer(
+            "Введите количество дней для изменения (например, +7 или -3):"
+        )
+        await state.set_state(GameStates.admin_waiting_date_change)
+        await callback.answer()
+    
+    elif action == "change_round":
+        await callback.message.answer(
+            "Введите новый номер тура (от 1 до 18):"
+        )
+        await state.set_state(GameStates.admin_waiting_round_change)
+        await callback.answer()
+    
+    elif action == "change_goals":
+        await callback.message.answer(
+            "Введите изменение количества голов (например, +2 или -1):"
+        )
+        await state.set_state(GameStates.admin_waiting_goals_change)
+        await callback.answer()
+    
+    elif action == "change_assists":
+        await callback.message.answer(
+            "Введите изменение количества передач (например, +2 или -1):"
+        )
+        await state.set_state(GameStates.admin_waiting_assists_change)
+        await callback.answer()
+    
+    elif action == "change_saves":
+        await callback.message.answer(
+            "Введите изменение количества сейвов (например, +5 или -2):"
+        )
+        await state.set_state(GameStates.admin_waiting_saves_change)
+        await callback.answer()
+    
+    elif action == "change_tackles":
+        await callback.message.answer(
+            "Введите изменение количества отборов (например, +3 или -1):"
+        )
+        await state.set_state(GameStates.admin_waiting_tackles_change)
+        await callback.answer()
+
+@dp.message(GameStates.admin_waiting_player_id)
+async def process_admin_player_id(message: types.Message, state: FSMContext):
+    print(f"Получено сообщение с ID игрока: {message.text}")  # Добавляем логирование
+    
+    if not is_admin(message.from_user.id):
+        await message.answer("❌ У вас нет прав для доступа к админ-панели.")
+        return
+    
+    try:
+        player_id = int(message.text)
+        print(f"Преобразовано в число: {player_id}")  # Добавляем логирование
+        
+        player = await get_player(player_id)
+        print(f"Найден игрок: {player}")  # Добавляем логирование
+        
+        if not player:
+            await message.answer(
+                "❌ Игрок не найден! Попробуйте еще раз:"
+            )
+            return
+        
+        # Сохраняем выбранный ID в базе данных
+        admin = await get_player(message.from_user.id)
+        if admin:
+            await update_player_stats(message.from_user.id, admin_selected_player_id=player_id)
+            print(f"ID игрока {player_id} сохранен для админа {message.from_user.id}")  # Добавляем логирование
+        
+        await message.answer(
+            f"✅ Выбран игрок: {player.name}\n"
+            f"Клуб: {player.club}\n"
+            f"Позиция: {player.position}\n\n"
+            "Выберите действие:",
+            reply_markup=get_admin_keyboard()
+        )
+        await state.set_state(None)
+    except ValueError:
+        print(f"Ошибка преобразования в число: {message.text}")  # Добавляем логирование
+        await message.answer(
+            "❌ Некорректный ID! Введите числовой ID игрока:"
+        )
+    except Exception as e:
+        print(f"Неожиданная ошибка: {e}")  # Добавляем логирование
+        await message.answer(
+            "❌ Произошла ошибка при обработке ID игрока. Попробуйте еще раз:"
+        )
+
+@dp.message(GameStates.admin_waiting_date_change)
+async def process_admin_date_change(message: types.Message, state: FSMContext):
+    try:
+        days = int(message.text)
+        admin = await get_player(message.from_user.id)
+        player_id = admin.admin_selected_player_id if admin else None
+        
+        if not player_id:
+            await message.answer("❌ Сначала выберите игрока!")
+            return
+        
+        player = await get_player(player_id)
+        if not player:
+            await message.answer("❌ Игрок не найден!")
+            return
+        
+        # Изменяем дату
+        current_date = datetime.strptime(player.last_match_date, "%d.%m.%Y")
+        new_date = current_date + timedelta(days=days)
+        new_date_str = new_date.strftime("%d.%m.%Y")
+        
+        await update_player_stats(player_id, last_match_date=new_date_str)
+        
+        await message.answer(
+            f"✅ Дата успешно изменена!\n"
+            f"Новая дата: {new_date_str}",
+            reply_markup=get_admin_keyboard()
+        )
+        await state.set_state(None)
+    except ValueError:
+        await message.answer(
+            "❌ Некорректное значение! Введите число дней (например, +7 или -3):"
+        )
+
+@dp.message(GameStates.admin_waiting_round_change)
+async def process_admin_round_change(message: types.Message, state: FSMContext):
+    try:
+        new_round = int(message.text)
+        if not 1 <= new_round <= 18:
+            await message.answer("❌ Номер тура должен быть от 1 до 18!")
+            return
+        
+        admin = await get_player(message.from_user.id)
+        player_id = admin.admin_selected_player_id if admin else None
+        
+        if not player_id:
+            await message.answer("❌ Сначала выберите игрока!")
+            return
+        
+        player = await get_player(player_id)
+        if not player:
+            await message.answer("❌ Игрок не найден!")
+            return
+        
+        await update_player_stats(player_id, current_round=new_round)
+        
+        await message.answer(
+            f"✅ Тур успешно изменен!\n"
+            f"Новый тур: {new_round}",
+            reply_markup=get_admin_keyboard()
+        )
+        await state.set_state(None)
+    except ValueError:
+        await message.answer(
+            "❌ Некорректное значение! Введите номер тура (от 1 до 18):"
+        )
+
+@dp.message(GameStates.admin_waiting_goals_change)
+async def process_admin_goals_change(message: types.Message, state: FSMContext):
+    try:
+        change = int(message.text)
+        admin = await get_player(message.from_user.id)
+        player_id = admin.admin_selected_player_id if admin else None
+        
+        if not player_id:
+            await message.answer("❌ Сначала выберите игрока!")
+            return
+        
+        player = await get_player(player_id)
+        if not player:
+            await message.answer("❌ Игрок не найден!")
+            return
+        
+        new_goals = max(0, player.goals + change)
+        await update_player_stats(player_id, goals=new_goals)
+        
+        await message.answer(
+            f"✅ Количество голов успешно изменено!\n"
+            f"Новое количество: {new_goals}",
+            reply_markup=get_admin_keyboard()
+        )
+        await state.set_state(None)
+    except ValueError:
+        await message.answer(
+            "❌ Некорректное значение! Введите изменение (например, +2 или -1):"
+        )
+
+@dp.message(GameStates.admin_waiting_assists_change)
+async def process_admin_assists_change(message: types.Message, state: FSMContext):
+    try:
+        change = int(message.text)
+        admin = await get_player(message.from_user.id)
+        player_id = admin.admin_selected_player_id if admin else None
+        
+        if not player_id:
+            await message.answer("❌ Сначала выберите игрока!")
+            return
+        
+        player = await get_player(player_id)
+        if not player:
+            await message.answer("❌ Игрок не найден!")
+            return
+        
+        new_assists = max(0, player.assists + change)
+        await update_player_stats(player_id, assists=new_assists)
+        
+        await message.answer(
+            f"✅ Количество передач успешно изменено!\n"
+            f"Новое количество: {new_assists}",
+            reply_markup=get_admin_keyboard()
+        )
+        await state.set_state(None)
+    except ValueError:
+        await message.answer(
+            "❌ Некорректное значение! Введите изменение (например, +2 или -1):"
+        )
+
+@dp.message(GameStates.admin_waiting_saves_change)
+async def process_admin_saves_change(message: types.Message, state: FSMContext):
+    try:
+        change = int(message.text)
+        admin = await get_player(message.from_user.id)
+        player_id = admin.admin_selected_player_id if admin else None
+        
+        if not player_id:
+            await message.answer("❌ Сначала выберите игрока!")
+            return
+        
+        player = await get_player(player_id)
+        if not player:
+            await message.answer("❌ Игрок не найден!")
+            return
+        
+        new_saves = max(0, player.saves + change)
+        await update_player_stats(player_id, saves=new_saves)
+        
+        await message.answer(
+            f"✅ Количество сейвов успешно изменено!\n"
+            f"Новое количество: {new_saves}",
+            reply_markup=get_admin_keyboard()
+        )
+        await state.set_state(None)
+    except ValueError:
+        await message.answer(
+            "❌ Некорректное значение! Введите изменение (например, +5 или -2):"
+        )
+
+@dp.message(GameStates.admin_waiting_tackles_change)
+async def process_admin_tackles_change(message: types.Message, state: FSMContext):
+    try:
+        change = int(message.text)
+        admin = await get_player(message.from_user.id)
+        player_id = admin.admin_selected_player_id if admin else None
+        
+        if not player_id:
+            await message.answer("❌ Сначала выберите игрока!")
+            return
+        
+        player = await get_player(player_id)
+        if not player:
+            await message.answer("❌ Игрок не найден!")
+            return
+        
+        new_tackles = max(0, player.tackles + change)
+        await update_player_stats(player_id, tackles=new_tackles)
+        
+        await message.answer(
+            f"✅ Количество отборов успешно изменено!\n"
+            f"Новое количество: {new_tackles}",
+            reply_markup=get_admin_keyboard()
+        )
+        await state.set_state(None)
+    except ValueError:
+        await message.answer(
+            "❌ Некорректное значение! Введите изменение (например, +3 или -1):"
+        )
+
+@dp.callback_query(lambda c: c.data == "admin_select_player")
+async def handle_select_player(callback: types.CallbackQuery, state: FSMContext):
+    print("Нажата кнопка выбора игрока")  # Добавляем логирование
+    
+    if not is_admin(callback.from_user.id):
+        await callback.answer("❌ У вас нет прав для доступа к админ-панели.", show_alert=True)
+        return
+    
+    print("Устанавливаем состояние admin_waiting_player_id")  # Добавляем логирование
+    await state.set_state(GameStates.admin_waiting_player_id)
+    
+    await callback.message.answer(
+        "Введите ID игрока:"
+    )
+    await callback.answer()
+    print("Состояние установлено, отправлено сообщение")  # Добавляем логирование
+
+@dp.callback_query(lambda c: c.data.startswith('admin_') and c.data != "admin_select_player")
+async def handle_admin_callback(callback: types.CallbackQuery, state: FSMContext):
+    print(f"Получен callback: {callback.data}")  # Добавляем логирование
+    
+    if not is_admin(callback.from_user.id):
+        await callback.answer("❌ У вас нет прав для доступа к админ-панели.", show_alert=True)
+        return
+    
+    action = callback.data.split('_')[1]
+    print(f"Действие: {action}")  # Добавляем логирование
+    
+    if action == "back":
+        await callback.message.delete()
+        return
+    
+    # Получаем текущий выбранный ID игрока из базы данных
+    admin = await get_player(callback.from_user.id)
+    player_id = admin.admin_selected_player_id if admin else None
+    print(f"Выбранный ID игрока: {player_id}")  # Добавляем логирование
+    
+    if not player_id:
+        await callback.message.answer(
+            "Сначала выберите игрока!",
+            reply_markup=get_admin_keyboard()
+        )
+        await callback.answer()
+        return
+    
+    if action == "change_date":
+        await callback.message.answer(
+            "Введите количество дней для изменения (например, +7 или -3):"
+        )
+        await state.set_state(GameStates.admin_waiting_date_change)
+        await callback.answer()
+    
+    elif action == "change_round":
+        await callback.message.answer(
+            "Введите новый номер тура (от 1 до 18):"
+        )
+        await state.set_state(GameStates.admin_waiting_round_change)
+        await callback.answer()
+    
+    elif action == "change_goals":
+        await callback.message.answer(
+            "Введите изменение количества голов (например, +2 или -1):"
+        )
+        await state.set_state(GameStates.admin_waiting_goals_change)
+        await callback.answer()
+    
+    elif action == "change_assists":
+        await callback.message.answer(
+            "Введите изменение количества передач (например, +2 или -1):"
+        )
+        await state.set_state(GameStates.admin_waiting_assists_change)
+        await callback.answer()
+    
+    elif action == "change_saves":
+        await callback.message.answer(
+            "Введите изменение количества сейвов (например, +5 или -2):"
+        )
+        await state.set_state(GameStates.admin_waiting_saves_change)
+        await callback.answer()
+    
+    elif action == "change_tackles":
+        await callback.message.answer(
+            "Введите изменение количества отборов (например, +3 или -1):"
+        )
+        await state.set_state(GameStates.admin_waiting_tackles_change)
+        await callback.answer()
+
+def get_player_data(user_id: int) -> Optional[dict]:
+    """Получает данные игрока из базы данных"""
+    try:
+        with engine.connect() as conn:
+            # Получаем данные игрока
+            query = text("""
+                SELECT * FROM players 
+                WHERE user_id = :user_id
+            """)
+            result = conn.execute(query, {"user_id": user_id})
+            player = result.fetchone()
+            
+            if not player:
+                logger.error(f"Игрок не найден в базе данных (user_id: {user_id})")
+                return None
+                
+            # Преобразуем результат в словарь
+            player_dict = dict(player._mapping)
+            
+            # Проверяем наличие обязательных полей
+            required_fields = ['user_id', 'name', 'position', 'club']
+            missing_fields = [field for field in required_fields if field not in player_dict]
+            
+            if missing_fields:
+                logger.error(f"Отсутствуют обязательные поля в данных игрока: {missing_fields}")
+                return None
+                
+            logger.info(f"Успешно получены данные игрока из базы (user_id: {user_id})")
+            return player_dict
+            
+    except Exception as e:
+        logger.error(f"Ошибка при получении данных игрока из базы (user_id: {user_id}): {e}")
+        return None
 
 if __name__ == "__main__":
     try:
