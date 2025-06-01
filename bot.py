@@ -794,13 +794,24 @@ async def get_opponent_by_round(player, current_round):
         
         try:
             # Парсим JSON календарь
-            calendar = json.loads(player.personal_calendar)
-        except json.JSONDecodeError as e:
-            logger.error(f"Ошибка при парсинге календаря игрока {player.name}: {e}")
-            # Создаем новый календарь при ошибке парсинга
+            calendar_data = player.personal_calendar
+            if isinstance(calendar_data, str):
+                calendar = json.loads(calendar_data)
+            else:
+                calendar = calendar_data  # если это уже объект (например, list/dict)
+                
+            # Убедимся, что calendar — это список
+            if not isinstance(calendar, list):
+                raise ValueError("Календарь должен быть списком")
+                
+        except (json.JSONDecodeError, ValueError) as e:
+            logger.error(f"Ошибка при обработке календаря: {e}")
+            
+            # Создаем новый календарь при ошибке
             calendar_json = create_player_calendar(player.club)
             if not calendar_json:
                 return None
+                
             await update_player_stats(
                 user_id=player.user_id,
                 personal_calendar=calendar_json
@@ -1000,60 +1011,56 @@ async def play_match_callback(callback_query: types.CallbackQuery, state: FSMCon
     """Обработчик нажатия кнопки 'Играть матч'"""
     try:
         user_id = callback_query.from_user.id
-        
+
         # Проверяем, не идет ли уже матч
         match_state = await state.get_data()
         if match_state.get('match_in_progress'):
             logger.warning(f"Попытка начать матч во время активной игры (user_id: {user_id})")
             await callback_query.answer("У вас уже идет матч!")
             return
-            
+
         # Получаем данные игрока
-        player = get_player(user_id)
+        player = await get_player(user_id)
         if not player:
             logger.error(f"Игрок не найден для пользователя {user_id}")
             await callback_query.answer("Ошибка: игрок не найден")
             return
-            
+
         # Проверяем, может ли игрок играть матч
-        can_play, reason = can_play_match(player)
+        can_play, reason = await can_play_match(player)
         if not can_play:
             logger.warning(f"Игрок {player.name} не может начать матч: {reason}")
             await callback_query.answer(reason)
             return
-            
+
         # Определяем текущий тур
         current_round = player.current_round
         logger.info(f"Начало матча для игрока {player.name} (тур {current_round})")
-        
+
         # Получаем соперника
-        opponent = get_opponent_by_round(player, current_round)
-        if not opponent:
-            logger.info(f"Сезон закончен для игрока {player.name}, начинаем новый сезон")
-            if not await start_new_season(player):
-                logger.error(f"Не удалось начать новый сезон для игрока {player.name}")
-                await callback_query.answer("Ошибка при начале нового сезона")
-                return
-                
-            # Получаем обновленные данные игрока после начала нового сезона
-            player = get_player(user_id)
-            if not player:
-                logger.error(f"Игрок не найден после начала нового сезона (user_id: {user_id})")
-                await callback_query.answer("Ошибка: игрок не найден")
-                return
-                
-            # Получаем соперника для нового сезона
-            opponent = get_opponent_by_round(player, 1)
-            if not opponent:
-                logger.error(f"Не удалось получить соперника для нового сезона (user_id: {user_id})")
-                await callback_query.answer("Ошибка: не удалось получить соперника")
-                return
-                
-            current_round = 1
-            
-        # Определяем, домашний матч или гостевой
-        is_home = opponent['home_team'] == player.club
-        
+        opponent_data = await get_opponent_by_round(player, current_round)
+
+        # Проверяем тип соперника и оборачиваем в словарь, если нужно
+        if isinstance(opponent_data, str):
+            logger.warning(f"Получен строковой соперник вместо словаря: {opponent_data}")
+            opponent = {
+                "home_team": player.club,
+                "away_team": opponent_data,
+                "round": current_round
+            }
+        elif isinstance(opponent_data, dict):
+            opponent = opponent_data
+        else:
+            logger.error(f"Неожиданный формат соперника: {type(opponent_data)}")
+            opponent = {
+                "home_team": player.club,
+                "away_team": random.choice(list(FNL_SILVER_CLUBS.keys())),
+                "round": current_round
+            }
+
+        # Теперь можно безопасно использовать
+        is_home = opponent["home_team"] == player.club
+
         # Инициализируем состояние матча
         match_state = {
             'match_in_progress': True,
@@ -1073,13 +1080,13 @@ async def play_match_callback(callback_query: types.CallbackQuery, state: FSMCon
             },
             'opponent_attacks': player.position == 'GK'  # Флаг для атак соперника
         }
-        
+
         # Сохраняем состояние матча
         await state.update_data(**match_state)
         
         # Начинаем матч
-        await start_match(callback_query, state)
-        
+        await start_match(callback_query.message, match_state, state)
+
     except Exception as e:
         logger.error(f"Критическая ошибка в play_match_callback: {e}")
         await callback_query.answer("Произошла ошибка при начале матча")
